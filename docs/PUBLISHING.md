@@ -1,12 +1,14 @@
 # Pubblicazione GeoLichen
 
-Preparazione del 15 ottobre 2026. Il plugin non è ancora pubblicato.
+Il codice è pubblicato su GitHub dal 15 ottobre 2026.
+L’invio al catalogo QGIS non è ancora stato effettuato.
 
 ## Da risolvere prima del rilascio pubblico
 
 1. Il repository pubblico è [LucaGrazia0/geolichens](https://github.com/LucaGrazia0/geolichens),
-   con Issues attive. Pubblicare soltanto codice, documentazione, licenza e
-   strumenti di sviluppo. Non caricare ZIP, dataset o cache.
+   con Issues attive. Sono pubblicati soltanto codice, documentazione, licenza e
+   strumenti di sviluppo, senza dataset né vecchia cronologia locale.
+   Non caricare ZIP, dataset o cache.
 2. `knowledge/`, `data/`, `examples/`, cache e snapshot restano privati e sono
    esclusi sia dal repository sia dal pacchetto QGIS. Il codice gestisce la
    mancanza dei dizionari opzionali e dell'indice locale con i fallback esistenti.

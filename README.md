@@ -95,8 +95,8 @@ Preview packages are for local testing and may contain incomplete metadata.
 The normal build rejects missing repository links and writes an upload ZIP
 under `dist/`, with a SHA-256 manifest. It excludes caches, bytecode, hidden files,
 compiled libraries, all datasets and old development notes. Do not commit ZIPs to the source
-repository. Publish release artifacts separately after the provenance checks in
-[PUBLISHING.md](docs/PUBLISHING.md) are resolved.
+repository. Publish release artifacts separately; see
+[PUBLISHING.md](docs/PUBLISHING.md).
 
 ## License and attribution
 
@@ -107,4 +107,4 @@ repository and release ZIP. The plugin uses built-in rules and live services
 when optional local dictionaries are absent; region-specific aliases, dictionary
 classifications and the local taxon index are then unavailable. The GPL declaration
 does not relicense third-party data. See [THIRD_PARTY.md](THIRD_PARTY.md) for
-sources, external services and the unresolved provenance details.
+dependencies and external services.
