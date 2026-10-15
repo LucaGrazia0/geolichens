@@ -1,0 +1,24 @@
+[general]
+name=GeoLichen
+description=Ecologically assisted georeferencing of historical lichen records in Italy.
+version=15.5.18
+qgisMinimumVersion=3.22
+qgisMaximumVersion=3.99
+author=Luca Grazia
+email=lucagrazia15@gmail.com
+about=Ranks candidate locations for historical lichen records using locality descriptions, ITALIC ecological profiles and user-supplied environmental layers. Provides candidate inspection, manual refinement, uncertainty estimates and provenance reports.
+    Requires QGIS 3 with Python, NumPy and GDAL (normally included in QGIS desktop installations). No additional pip packages or QGIS plugins are required.
+    Internet access is required for ITALIC and OpenStreetMap/Overpass queries. Automatic geocoding requires a user-supplied MapTiler API key and is subject to the provider's terms and quotas.
+    Intended for Italian locality descriptions and Italian lichens, with a default search area of Lombardy. Interface language: Italian. Datasets, optional local dictionaries, taxon indexes, environmental layers and DEMs are not bundled. Local dictionary enhancements are unavailable unless supplied separately.
+    Results are model estimates requiring expert review. QGIS 4 is not supported by this release. Windows and Linux need release testing.
+homepage=https://github.com/LucaGrazia0/geolichens#readme
+repository=https://github.com/LucaGrazia0/geolichens
+tracker=https://github.com/LucaGrazia0/geolichens/issues
+license=GPL-2.0-or-later
+category=Vector
+tags=lichens,georeferencing,biodiversity,ecology,uncertainty,italy
+experimental=True
+deprecated=False
+hasProcessingProvider=False
+changelog=15.5.18: Prepare public distribution, document requirements, use QGIS networking for ITALIC and MapTiler, and store runtime data in the QGIS profile.
+    15.5.17: Simplified controller interface, reuse of confirmed points and manual line corridor.
