@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import re
 import math
 import json
@@ -4422,6 +4424,9 @@ class PluginController:
             self._warn('Nessun buffer/boundary disponibile. Prima analizza un record, crea un buffer manuale oppure termina la linea manuale.')
             return
 
+        measure = (self.performance_service.measure if self.performance_service is not None
+                   else lambda name: nullcontext({}))
+
         self._clear_osm_trails()
 
         # OSM/Overpass: scarica una sola volta per elaborazione i sentieri
@@ -4437,10 +4442,14 @@ class PluginController:
                 # The trail query is independent from the OSM locality query.
                 # Remove only the previous temporary trail layer; never reuse a
                 # locality-geometry response as if it already contained trails.
-                osm_result = self.osm_trail_service.fetch(
-                    self.search_extent,
-                    QgsCoordinateReferenceSystem("EPSG:4326"),
-                )
+                with measure("download_sentieri_osm") as timing:
+                    osm_result = self.osm_trail_service.fetch(
+                        self.search_extent,
+                        QgsCoordinateReferenceSystem("EPSG:4326"),
+                    )
+                    timing.update(success=osm_result.success, from_cache=osm_result.from_cache,
+                                  feature_count=osm_result.feature_count)
+
                 if osm_result.success and osm_result.layer is not None and osm_result.feature_count > 0:
                     self.current_osm_trail_layer = osm_result.layer
                     trail_layers = [osm_result.layer] + [lyr for lyr in trail_layers if lyr is not osm_result.layer]
@@ -4451,6 +4460,7 @@ class PluginController:
                     summary = self.osm_trail_service.layer_summary(osm_result.layer) + cache_text
                     if osm_result.warning:
                         summary += ' ' + str(osm_result.warning)
+                        osm_notice = str(osm_result.warning)
                     self.dock.set_osm_trails_info(summary)
                     self.dock.set_status(
                         f"{osm_result.feature_count} geometrie sentieristiche OSM trovate{cache_text}"
@@ -4524,36 +4534,37 @@ class PluginController:
             except Exception:
                 context_point = None
 
-            result = self.habitat_suitability_service.find_best_point(
-                # La griglia deve essere generata sull'intera SearchGeometry,
-                # mai sulla DocumentedGeometry o sull'ecological_candidate_extent.
-                buffer_geom=self.search_extent,
-                original_locality_extent=self.original_locality_extent,
-                search_extent=self.search_extent,
-                constraint_metadata=self.current_constraint_metadata,
-                profile=profile,
-                geology_layer=geology_layer,
-                geology_field=geology_field,
-                soil_layer=soil_layer,
-                soil_field=soil_field,
-                trees_layer=trees_layer,
-                trees_field=trees_field,
-                trail_layer=trail_layer,
-                trail_layers=trail_layers,
-                vegetation_belt_layer=vegetation_belt_layer,
-                vegetation_belt_field=vegetation_belt_field,
-                dem_layer=dem_layer,
-                dem_layers=dem_layers,
-                grid_step_m=self._get_suitability_grid_step(),
-                create_layer=True,
-                layer_name='Habitat suitability - punti',
-                visualization_mode=self._get_suitability_visualization_mode(),
-                heatmap_radius_mm=self._get_heatmap_radius_mm(),
-                heatmap_opacity=self._get_heatmap_opacity(),
-                context=context,
-                context_point=context_point,
-                locality_context=self.current_locality_context,
-            )
+            with measure("calcolo_ecologico"):
+                result = self.habitat_suitability_service.find_best_point(
+                    # La griglia deve essere generata sull'intera SearchGeometry,
+                    # mai sulla DocumentedGeometry o sull'ecological_candidate_extent.
+                    buffer_geom=self.search_extent,
+                    original_locality_extent=self.original_locality_extent,
+                    search_extent=self.search_extent,
+                    constraint_metadata=self.current_constraint_metadata,
+                    profile=profile,
+                    geology_layer=geology_layer,
+                    geology_field=geology_field,
+                    soil_layer=soil_layer,
+                    soil_field=soil_field,
+                    trees_layer=trees_layer,
+                    trees_field=trees_field,
+                    trail_layer=trail_layer,
+                    trail_layers=trail_layers,
+                    vegetation_belt_layer=vegetation_belt_layer,
+                    vegetation_belt_field=vegetation_belt_field,
+                    dem_layer=dem_layer,
+                    dem_layers=dem_layers,
+                    grid_step_m=self._get_suitability_grid_step(),
+                    create_layer=True,
+                    layer_name='Habitat suitability - punti',
+                    visualization_mode=self._get_suitability_visualization_mode(),
+                    heatmap_radius_mm=self._get_heatmap_radius_mm(),
+                    heatmap_opacity=self._get_heatmap_opacity(),
+                    context=context,
+                    context_point=context_point,
+                    locality_context=self.current_locality_context,
+                )
 
             result['osm_trails_notice'] = osm_notice
             candidates = result.get('display_features') or result.get('features') or []

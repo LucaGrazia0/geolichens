@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import json
 import os
 import platform
@@ -38,6 +40,22 @@ class PerformanceService:
         if len(self.records) > self.max_records:
             self.records = self.records[-self.max_records:]
         return item
+
+    @contextmanager
+    def measure(self, operation):
+        """Record a phase, including failures, without changing its result."""
+        token = self.start(operation)
+        details = {}
+        status = "ok"
+        try:
+            yield details
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            if details.get("success") is False:
+                status = "error"
+            self.finish(token, status=status, details=details)
 
     def clear(self):
         self.records = []

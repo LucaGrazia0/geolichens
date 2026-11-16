@@ -1,6 +1,6 @@
 # GeoLichen - Manuale utente
 
-**Versione del plugin:** 15.6.32  
+**Versione del plugin:** 15.6.33  
 **Edizione del manuale:** 2.0 - 16 novembre 2026  
 **Autore del plugin:** Luca Grazia
 
@@ -47,7 +47,7 @@ L'interfaccia è in italiano. Descrizioni di località, regole e profili sono pe
 ## 2. Installazione e trasferimento su Windows
 ### Installare da ZIP
 
-1. Procurati il pacchetto `geolichen-15.6.32.zip` della distribuzione.
+1. Procurati il pacchetto `geolichen-15.6.33.zip` della distribuzione.
 2. Apri QGIS e scegli **Plugins > Gestisci ed Installa Plugin > Installa da ZIP**. Nelle interfacce inglesi: **Plugins > Manage and Install Plugins > Install from ZIP**.
 3. Seleziona lo ZIP senza decomprimerlo e premi **Installa plugin**.
 4. Verifica che GeoLichen sia abilitato nella scheda dei plugin installati.
@@ -629,7 +629,7 @@ Cache e snapshot ITALIC sono conservati nel profilo QGIS, nella sottocartella Ge
 - [GDAL: opzioni di esportazione CSV](https://gdal.org/en/stable/drivers/vector/csv.html).
 
 
-Questo manuale è stato confrontato con interfaccia, controller e servizi della versione 15.6.32. Per i dettagli implementativi: `services/scoring_model.py`, `services/model_uncertainty_service.py`, `services/model_confidence_service.py`, `services/solution_stability_service.py`, `services/confirmation_fields_service.py` e `controllers/plugin_controller.py`.
+Questo manuale è stato confrontato con interfaccia, controller e servizi della versione 15.6.33. Per i dettagli implementativi: `services/scoring_model.py`, `services/model_uncertainty_service.py`, `services/model_confidence_service.py`, `services/solution_stability_service.py`, `services/confirmation_fields_service.py` e `controllers/plugin_controller.py`.
 
 - [Sorgenti e README GeoLichen](https://github.com/LucaGrazia0/geolichens).
 - [Segnalazione problemi](https://github.com/LucaGrazia0/geolichens/issues): indica versione QGIS, sistema operativo, versione GeoLichen, azione e messaggio di errore; evita di pubblicare chiavi API o dati riservati.
@@ -668,3 +668,27 @@ coordinate WGS84 e incertezza GeoLichen R55–S65; non scrive nella tabella.
 Se nessun punto supera i filtri, l'avviso invita a controllare località, buffer,
 quota/DEM e campi ambientali. Non interpretare l'assenza di candidati come prova
 che la specie sia assente nella zona.
+
+
+### Overpass indisponibile e tempi dell'analisi — 15.6.33
+
+Un HTTP 502 indica una richiesta fallita sul lato del servizio; non prova che
+non esistano sentieri. Il pulsante di analisi comprende anche il download OSM:
+la finestra **Performance e robustezza** ora distingue `download_sentieri_osm`
+e `calcolo_ecologico`, con durata e stato. Anche i tentativi falliti sono misurati.
+
+La risposta completa della stessa richiesta viene riutilizzata per 24 ore senza
+rete. Dopo un errore online, il plugin può recuperare l'archivio della richiesta
+identica fino a 30 giorni, mostrando l'età e «non aggiornato». Il ritaglio segue
+sempre il buffer corrente. Questa risposta non diventa una nuova acquisizione:
+il file conserva la sua data e non viene rinnovato artificialmente. Risposte
+parziali, archivio troppo vecchio e dati di altre aree non vengono usati.
+
+Dopo un download fallito, una ripetizione sulla stessa area entro 60 secondi
+non rilancia altre richieste; la presenza di una cache fresca ha comunque priorità.
+Al termine di tale pausa è possibile un nuovo tentativo. La prima richiesta può
+ancora attendere i timeout dei due server. Se non esiste un archivio utilizzabile,
+il problema resta segnalato e non vengono inventati sentieri. Puoi selezionare
+un tuo layer sentieristico in **Accessibilità**; verifica provenienza e copertura.
+Usare dati archiviati può cambiare lo score rispetto all'assenza di accessibilità,
+perché cambia l'evidenza disponibile, non la formula del modello.

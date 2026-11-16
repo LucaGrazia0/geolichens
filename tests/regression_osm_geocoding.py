@@ -2,6 +2,8 @@
 import copy
 import importlib.util
 import json
+import os
+import time
 from pathlib import Path
 import sys
 import tempfile
@@ -38,6 +40,8 @@ FETCH = 'geolichen.services.osm_geocoding_service.fetch_text'
 
 class OsmGeocodingRegression(unittest.TestCase):
     def setUp(self):
+        OsmTrailService._recent_failures.clear()
+        self.addCleanup(OsmTrailService._recent_failures.clear)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.service = GeocodingService(cache_dir=self.temp.name)
@@ -429,6 +433,76 @@ class OsmGeocodingRegression(unittest.TestCase):
         summary = OsmTrailService.layer_summary(layer)
         self.assertIn('pedonali/equestri: 0', summary)
         self.assertIn('Nessun sentiero pedonale', summary)
+
+    def test_expired_identical_trail_cache_recovers_after_502_without_refreshing_age(self):
+        geometry = QgsGeometry.fromRect(QgsRectangle(10.199, 46.049, 10.202, 46.052))
+        service = OsmTrailService(query_margin_m=0)
+        payload = self.trail_payload([[(10.198, 46.05), (10.203, 46.05)]])
+        path = Path(self.temp.name) / 'archive.json'
+        path.write_text(json.dumps(payload))
+        old_time = time.time() - 2 * 86400
+        os.utime(path, (old_time, old_time))
+        original = path.read_bytes()
+        with patch.object(service, '_cache_path', return_value=str(path)), \
+             patch.object(service, '_download', return_value=(None, 'Overpass HTTP 502: server occupato', service.endpoint)) as download:
+            first = service.fetch(geometry)
+            second = service.fetch(geometry)
+        self.assertTrue(first.success, first.error)
+        self.assertTrue(first.from_cache)
+        self.assertIn('2.0 giorni', first.warning)
+        self.assertIn('502', first.warning)
+        self.assertTrue(second.success)
+        self.assertEqual(download.call_count, 1)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(path.stat().st_mtime, old_time)
+        self.assertTrue(first.layer.customProperty('geolichen/osm_archive_fallback'))
+        feature = next(first.layer.getFeatures())
+        self.assertLessEqual(feature.geometry().difference(geometry).length(), 1e-10)
+
+    def test_partial_too_old_and_disabled_archives_are_not_recovered(self):
+        service = OsmTrailService()
+        path = Path(self.temp.name) / 'old.json'
+        cases = [({'elements': [], 'remark': 'partial'}, 2), ({'elements': []}, 31)]
+        for payload, days in cases:
+            path.write_text(json.dumps(payload))
+            stamp = time.time() - days * 86400
+            os.utime(path, (stamp, stamp))
+            self.assertIsNone(service._read_cache(str(path), allow_expired=True))
+        path.write_text('{"elements":[]}')
+        service.cache_ttl_hours = 0
+        self.assertIsNone(service._read_cache(str(path), allow_expired=True))
+
+    def test_failed_query_cooldown_expires_and_does_not_block_other_areas(self):
+        service = OsmTrailService(query_margin_m=0)
+        geometry = QgsGeometry.fromRect(QgsRectangle(10.199, 46.049, 10.202, 46.052))
+        other = QgsGeometry.fromRect(QgsRectangle(10.299, 46.049, 10.302, 46.052))
+        with patch.object(QgsApplication, 'qgisSettingsDirPath', return_value=self.temp.name), \
+             patch.object(service, '_download', return_value=(None, 'Overpass HTTP 502', service.endpoint)) as download:
+            with patch('geolichen.services.osm_trail_service.time.monotonic', return_value=100):
+                self.assertFalse(service.fetch(geometry).success)
+                repeated = service.fetch(geometry)
+                self.assertIn('tra 60 s', repeated.error)
+                self.assertEqual(download.call_count, 1)
+                self.assertFalse(service.fetch(other).success)
+                self.assertEqual(download.call_count, 2)
+            with patch('geolichen.services.osm_trail_service.time.monotonic', return_value=161):
+                self.assertFalse(service.fetch(geometry).success)
+                self.assertEqual(download.call_count, 3)
+
+    def test_fresh_cache_wins_over_previous_failure_cooldown(self):
+        service = OsmTrailService(query_margin_m=0)
+        geometry = QgsGeometry.fromRect(QgsRectangle(10.199, 46.049, 10.202, 46.052))
+        path = Path(self.temp.name) / 'new.json'
+        payload = self.trail_payload([[(10.2, 46.05), (10.201, 46.05)]])
+        with patch.object(service, '_cache_path', return_value=str(path)), \
+             patch.object(service, '_download', return_value=(None, 'HTTP 502', service.endpoint)) as download:
+            self.assertFalse(service.fetch(geometry).success)
+            path.write_text(json.dumps(payload))
+            result = service.fetch(geometry)
+        self.assertTrue(result.success)
+        self.assertTrue(result.from_cache)
+        self.assertNotIn('non aggiornato', result.warning or '')
+        self.assertEqual(download.call_count, 1)
 
     def test_trails_fetch_builds_real_line_attributes_and_reuses_cache(self):
         payload = {'elements': [{'type': 'way', 'id': 12345, 'tags': {

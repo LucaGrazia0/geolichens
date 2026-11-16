@@ -1,5 +1,12 @@
 # Changelog
 
+## 15.6.33 - Overpass outage recovery and phase timings
+
+- Preserve the 24-hour fresh trail cache. After download failure, recover only an identical-query, complete archive no older than 30 days; label its age and failure, clip it again to the current buffer and preserve its original modification time.
+- Suppress repeated failed requests for the identical cache key for 60 seconds across service instances; preserve fresh-cache precedence, existing refusal handling and retry after expiry. No server bypass or extra endpoint is added.
+- Record separate download_sentieri_osm and calcolo_ecologico phase timings, including failed runs, in the existing performance dialog. Propagate archive warnings into the ecological result notice.
+- Leave scoring, uncertainty and altitude filters unchanged. New downloads still depend on Overpass availability; no partial response becomes a trail dataset.
+
 ## 15.6.32 - First public CI compatibility corrections
 
 - Activate source-only GitHub CI after synchronizing the public repository.

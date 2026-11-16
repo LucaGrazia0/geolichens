@@ -71,6 +71,18 @@ class Diagnostics(unittest.TestCase):
                 self.assertEqual(stale['cache_status'], 'expired_used_as_fallback')
                 self.assertEqual(stale['rock_type'], fresh['rock_type'])
 
+    def test_phase_measurement_records_failure_and_releases_active_token(self):
+        service = PerformanceService()
+        with service.measure('download_sentieri_osm') as details:
+            details.update(success=False, from_cache=False)
+        self.assertEqual(service.records[-1]['status'], 'error')
+        with self.assertRaisesRegex(ValueError, 'original error'):
+            with service.measure('calcolo_ecologico'):
+                raise ValueError('original error')
+        self.assertFalse(service._active)
+        self.assertEqual(service.records[-1]['status'], 'error')
+        self.assertGreaterEqual(service.records[-1]['duration_s'], 0)
+
     def test_dialog_updates_only_scoped_diagnostic_setting(self):
         from qgis.PyQt.QtWidgets import QMainWindow
         from types import SimpleNamespace

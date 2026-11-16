@@ -1,5 +1,11 @@
 # GeoLichen
 
+**15.6.33:** in caso di errore Overpass, recupero della risposta completa della
+stessa richiesta dall’archivio locale fino a 30 giorni, con età e avviso visibili.
+La cache ordinaria resta valida 24 ore; le richieste fallite per la stessa area
+non sono ripetute per 60 secondi. La finestra Performance separa download OSM
+e calcolo ecologico. Questo non ripristina i server pubblici indisponibili.
+
 **15.6.32:** controlli GitHub attivati; corretta la finestra candidato per Qt 6.
 I risultati delle prove automatiche sono consultabili in
 [GitHub Actions](https://github.com/LucaGrazia0/geolichens/actions/workflows/checks.yml).
@@ -40,7 +46,7 @@ using ecological and environmental information, and supports expert review,
 manual refinement, uncertainty estimates and provenance reporting.
 
 Il [manuale utente in italiano](docs/MANUALE_UTENTE.md) descrive installazione,
-configurazione, analisi, interpretazione dei risultati e salvataggio per la 15.6.32.
+configurazione, analisi, interpretazione dei risultati e salvataggio per la 15.6.33.
 Per la nuova ricerca OSM senza API key, leggi anche [migrazione 15.6.20](docs/OSM_MIGRATION_15_6_20.md).
 Per i buffer circolari delle località e l'attesa del download sentieri, vedi
 [aggiornamento 15.6.25](docs/CIRCULAR_BUFFERS_15_6_25.md).

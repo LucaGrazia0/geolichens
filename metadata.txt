@@ -1,7 +1,7 @@
 [general]
 name=GeoLichen
 description=Ecologically assisted georeferencing of historical lichen records in Italy.
-version=15.6.32
+version=15.6.33
 qgisMinimumVersion=3.22
 qgisMaximumVersion=4.99
 author=Luca Grazia
@@ -20,7 +20,8 @@ tags=lichens,georeferencing,biodiversity,ecology,uncertainty,italy
 experimental=True
 deprecated=False
 hasProcessingProvider=False
-changelog=15.6.32: Fix Qt 6 candidate dialog text format; make indexed snapping regression accept documented equidistant neighbors. Activate public QGIS CI.
+changelog=15.6.33: Recover complete identical-query OSM archives after download failures, avoid immediate repeated failed requests, and separate trail-download and ecological-calculation timings.
+    15.6.32: Fix Qt 6 candidate dialog text format; make indexed snapping regression accept documented equidistant neighbors. Activate public QGIS CI.
     15.6.31: Add automated release checks, scoped QGIS diagnostics and current OSM user documentation; preserve scoring and network security.
     15.6.30: Allow slow Photon replies up to 35 seconds within a shared 80-second search budget; recover valid cached locality variants after a municipality network failure.
     15.6.29: Add non-modal candidate coordinate/model uncertainty preview, explain empty ecological results and clear stale candidates on analysis failure.

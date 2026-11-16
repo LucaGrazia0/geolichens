@@ -64,6 +64,9 @@ class OsmTrailService:
         "living_street",
     )
     CACHE_VERSION = "osm_trails_v3_buffer_clip"
+    ARCHIVE_MAX_AGE_HOURS = 30 * 24
+    FAILURE_RETRY_SECONDS = 60
+    _recent_failures = {}
     FALLBACK_ENDPOINTS = (
         "https://overpass-api.de/api/interpreter",
         "https://overpass.private.coffee/api/interpreter",
@@ -138,16 +141,44 @@ class OsmTrailService:
             cache_path = self._cache_path(bbox, query)
             payload = self._read_cache(cache_path)
             from_cache = payload is not None
+            archive_notice = None
             if payload is None:
-                payload, error, endpoint_used = self._download(query)
+                failure = self._recent_failures.get(cache_path)
+                if failure and time.monotonic() < failure[0]:
+                    payload, error, endpoint_used = None, failure[1], self.endpoint
+                    remaining = max(1, math.ceil(failure[0] - time.monotonic()))
+                    error += f" Nuovo tentativo per quest'area tra {remaining} s."
+                else:
+                    payload, error, endpoint_used = self._download(query)
                 if error:
-                    return self._failure(error, started, bbox=bbox)
-                self.endpoint = endpoint_used or self.endpoint
-                self._write_cache(cache_path, payload)
+                    # Only the identical query may recover an older complete
+                    # response. Never reset its age or cache a failed request.
+                    if not failure or time.monotonic() >= failure[0]:
+                        self._recent_failures[cache_path] = (time.monotonic() + self.FAILURE_RETRY_SECONDS, error)
+                        if len(self._recent_failures) > 128:
+                            oldest = min(self._recent_failures, key=lambda key: self._recent_failures[key][0])
+                            self._recent_failures.pop(oldest, None)
+                    payload = self._read_cache(cache_path, allow_expired=True)
+                    if payload is None:
+                        return self._failure(error, started, bbox=bbox)
+                    from_cache = True
+                    age_hours = max(0.0, (time.time() - os.path.getmtime(cache_path)) / 3600.0)
+                    archive_notice = (f"Overpass non disponibile: usato archivio locale di {age_hours / 24:.1f} giorni "
+                                      f"per la stessa area, non aggiornato. {error}")
+                else:
+                    self._recent_failures.pop(cache_path, None)
+                    self.endpoint = endpoint_used or self.endpoint
+                    self._write_cache(cache_path, payload)
 
-            # Cache the raw response, then clip again to the exact current buffer.
-            # Different buffers can share an envelope without sharing their shape.
+            # Every response, including an archived one, is clipped again.
             layer, count, warning = self._parse_to_layer(payload, clip_geometry)
+            if archive_notice:
+                warning = " ".join(text for text in (archive_notice, warning) if text)
+                if layer is not None:
+                    layer.setCustomProperty('geolichen/osm_archive_fallback', True)
+                    layer.setCustomProperty('geolichen/osm_archive_age_hours', age_hours)
+                    layer.setCustomProperty('geolichen/osm_archive_warning', archive_notice)
+
             elapsed_ms = int((time.monotonic() - started) * 1000)
             if layer is None:
                 return OsmTrailResult(
@@ -386,12 +417,13 @@ class OsmTrailService:
         key = hashlib.sha256((self.CACHE_VERSION + repr(rounded) + query).encode("utf-8")).hexdigest()
         return os.path.join(base, key + ".json")
 
-    def _read_cache(self, path):
+    def _read_cache(self, path, allow_expired=False):
         if self.cache_ttl_hours <= 0 or not os.path.exists(path):
             return None
         try:
             age_h = (time.time() - os.path.getmtime(path)) / 3600.0
-            if age_h > self.cache_ttl_hours:
+            max_age = self.ARCHIVE_MAX_AGE_HOURS if allow_expired else self.cache_ttl_hours
+            if age_h < 0 or age_h > max_age:
                 return None
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)

@@ -401,3 +401,25 @@ https://github.com/LucaGrazia0/geolichens/actions/runs/43898848525
 The runtime correction is limited to Qt.TextFormat.RichText. No ecological
 formula or uncertainty threshold changed. Windows and full interactive QGIS 4
 acceptance remain pending; no external API availability guarantee is implied.
+
+
+## 15.6.33 — Overpass outage recovery and measured phases
+
+Local full preparation passed on macOS/QGIS 3.44.9: 242 regressions (3 release
+safety, 23 scoring, 32 spatial analysis, 42 OSM, 35 locality, 100 interface,
+7 diagnostics) plus the full local-network smoke test. Ruff correctness passed.
+
+New tests check complete identical-query archive recovery after HTTP 502,
+unchanged original cache age/content, exact clipping, rejection of partial and
+older-than-30-day responses, fresh-cache priority, retry cooldown expiry and
+isolation between areas. Phase measurement records failures without swallowing
+exceptions. Ecological calculation, weights, uncertainty and altitude filters
+are unchanged; the benchmark in the preceding version still reports identical
+optimized/reference outputs and does not include live network or user layers.
+
+Read-only public status checks from this workstation received HTTP 406 from the
+primary status endpoint and a 12-second timeout from the secondary. These are
+not a reproduction of the user's exact QGIS request, reported as HTTP 502.
+No further live download was attempted to bypass a refusal. The public servers'
+availability is not repaired by the archive fallback. No data/cache file was
+modified by diagnostic inspection; old cached responses retain their age.

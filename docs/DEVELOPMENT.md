@@ -1,4 +1,4 @@
-# GeoLichen 15.6.32 — sviluppo, verifiche e distribuzione
+# GeoLichen 15.6.33 — sviluppo, verifiche e distribuzione
 
 ## Versione di riferimento
 
@@ -73,7 +73,7 @@ Fonti: [immagini ufficiali](https://github.com/qgis/qgis-docker),
 Usa il Python di QGIS:
 
 ```sh
-python -B tools/prepare_release.py --source-dir dist/geolichen-15.6.32-public-source
+python -B tools/prepare_release.py --source-dir dist/geolichen-15.6.33-public-source
 ```
 
 La procedura controlla i sorgenti, esegue tutte le suite e poi crea lo ZIP con
