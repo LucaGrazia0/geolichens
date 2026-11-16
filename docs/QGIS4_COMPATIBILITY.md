@@ -98,3 +98,24 @@ No platform claim is upgraded based on the template alone. Metadata retains the
 existing experimental range; stability and publication still require acceptance.
 Use `tools/run_checks.py --expect-qgis MAJOR.MINOR` for a recorded check in each
 runtime. See DEVELOPMENT.md for Windows commands and distribution procedure.
+
+
+## 15.6.32 — first successful public CI (16 November 2026)
+
+The complete GitHub workflow passed after two corrections: the candidate dialog
+uses Qt.TextFormat.RichText, and the snap test accepts the spatial index's
+documented equidistant neighbors instead of assuming an absolute eight-ID cap.
+Production snapping, ecological scoring and uncertainty formulas are unchanged.
+
+| Environment | Evidence | Status |
+| --- | --- | --- |
+| macOS, QGIS 3.44.9 / Qt 5 | dist/checks-15.6.32.json, all eight suites | Passed locally |
+| Linux, QGIS 3.40.15 / Qt 5 | Official pinned image, full workflow | Passed online |
+| Linux, QGIS 4.2.3 / Qt 6 | Official pinned image, full workflow | Passed online |
+| Package preparation | Source checks plus both QGIS jobs | Passed online |
+| Windows, QGIS 3.40 or 4 | Full runner and interactive checklist available | Pending |
+| Interactive desktop acceptance on QGIS 4 | Checklist above | Pending |
+
+[Successful workflow for commit 587caf2](https://github.com/LucaGrazia0/geolichens/actions/runs/43898848525).
+These headless runtime checks do not replace Windows or interactive acceptance,
+nor do they validate public server availability or scientific accuracy.

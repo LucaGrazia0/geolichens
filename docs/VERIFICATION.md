@@ -383,3 +383,21 @@ The initial smoke attempt was prevented by local server socket permissions;
 repeating the complete preparation with the required permission passed.
 No TLS exceptions, datasets, user project attributes or cache contents changed.
 The manual now documents 15.6.31; older PDFs have not been regenerated.
+
+
+## 15.6.32 — public CI enabled and validated (16 November 2026)
+
+Public source was synchronized without importing local Git history or datasets.
+All 161 public files matched the expected Git blob hashes before updating main.
+The first run exposed a real Qt 6 integer text-format error in the candidate
+editor and an incorrect test assumption about equidistant spatial-index IDs.
+Both were corrected, retaining the full test coverage and selection behavior.
+
+Local full preparation passed on macOS/QGIS 3.44.9 (237 regressions plus smoke).
+The complete public run then passed source checks, QGIS 3.40.15 / Qt 5,
+QGIS 4.2.3 / Qt 6 and gated packaging on Linux:
+https://github.com/LucaGrazia0/geolichens/actions/runs/43898848525
+
+The runtime correction is limited to Qt.TextFormat.RichText. No ecological
+formula or uncertainty threshold changed. Windows and full interactive QGIS 4
+acceptance remain pending; no external API availability guarantee is implied.

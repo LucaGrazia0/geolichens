@@ -37,10 +37,10 @@ Sono disponibili tre percorsi:
 - Layer ambientali e DEM con copertura adeguata, per le componenti che vuoi valutare.
 
 I metadati consentono QGIS 3.22–3.99 e QGIS 4.x. Questo intervallo non equivale
-alla verifica completa di ogni sistema. Le prove locali della 15.6.31 usano
-QGIS 3.44.9 su macOS; i controlli automatici per QGIS 3.40 e 4.2 sono predisposti
-ma richiedono l'esecuzione su GitHub. Windows/Linux e QGIS 4 richiedono inoltre
-prove interattive: consulta [compatibilità e stato](QGIS4_COMPATIBILITY.md).
+alla verifica completa di ogni sistema. Le prove locali della 15.6.32 usano
+QGIS 3.44.9 su macOS. Le suite automatiche su Linux/QGIS 3.40.15 e 4.2.3 sono
+passate su GitHub. Restano da eseguire le prove su Windows e la verifica
+interattiva completa di QGIS 4: consulta [compatibilità e stato](QGIS4_COMPATIBILITY.md).
 
 L'interfaccia è in italiano. Descrizioni di località, regole e profili sono pensati principalmente per l'Italia; la ricerca parte dalla Lombardia. Non sono inclusi dataset, DEM, dizionari locali opzionali o un indice locale dei taxa.
 
