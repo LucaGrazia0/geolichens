@@ -1,3 +1,6 @@
+from .context_engine import ContextEngine
+
+
 class AccessibilityEngine:
     """Accessibilità come confidence morbida, senza penalità hard."""
 
@@ -53,12 +56,12 @@ class AccessibilityEngine:
 
     def context_confidence(self, context_dist_m, context=None):
         context = context or {}
-        ctx_type = str(context.get("type") or "").lower()
+        ctx_type = ContextEngine().normalize_type(context.get("type"))
         try:
             if context_dist_m is None:
                 return 50.0
             d = float(context_dist_m)
-            if ctx_type in ["pass", "summit_peak", "refuge_malga", "hydro", "lake"]:
+            if ctx_type in ["pass", "summit", "refuge_malga", "hydro", "lake"]:
                 if d <= 100: return 100.0
                 if d <= 300: return 90.0
                 if d <= 700: return 75.0
@@ -78,23 +81,16 @@ class AccessibilityEngine:
             return 50.0
 
     def trail_weight(self, context=None):
-        context = context or {}
-        ctx_type = str(context.get("type") or "").lower()
-        text = str(context.get("text") or context.get("raw") or "").lower()
-        if any(k in text for k in ["sentiero", "mulattiera", "traccia", "strada forestale", "cai", "via "]) or ctx_type == "trail":
-            return 0.70
-        if ctx_type in ["pass", "refuge_malga"]:
-            return 0.45
-        if ctx_type in ["mountain_area", "mountain_group", "forest_area", "valley"]:
-            return 0.25
-        return 0.35
+        """Compatibility API: only trail evidence contributes to Accessibility."""
+        return 1.0
 
     def final_accessibility_score(self, trail_dist_m=None, context_dist_m=None, context=None):
         trail = self.trail_confidence(trail_dist_m)
         ctx = self.context_confidence(context_dist_m, context=context)
-        tw = self.trail_weight(context)
-        cw = 1.0 - tw
-        acc = max(0.0, min(100.0, (tw * trail) + (cw * ctx)))
+        # Locality coherence belongs only to Geography. A missing trail
+        # measurement stays neutral instead of borrowing geographic evidence.
+        tw, cw = self.trail_weight(context), 0.0
+        acc = trail
         return {
             "accessibility_score": acc,
             "accessibility_confidence": acc,
@@ -103,5 +99,5 @@ class AccessibilityEngine:
             "context_score": ctx,
             "context_weight": cw,
             "trail_weight": tw,
-            "rule": "soft_accessibility_confidence_no_penalty",
+            "rule": "independent_trail_accessibility_missing_neutral",
         }

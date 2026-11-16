@@ -5,6 +5,7 @@ Overpass query -> OSM elements -> QGIS geometries.  It does not depend on
 QuickOSM and is used only before the semantic-buffer fallback is applied.
 """
 from __future__ import annotations
+from ..core.enum_utils import enum_value
 
 import hashlib
 import json
@@ -17,11 +18,8 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
 
-from qgis.PyQt.QtCore import QByteArray, QUrl
-from qgis.PyQt.QtNetwork import QNetworkRequest
 from qgis.core import (
     QgsApplication,
-    QgsBlockingNetworkRequest,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsGeometry,
@@ -30,6 +28,7 @@ from qgis.core import (
 )
 
 from ._shared_geo_utils import local_metric_crs
+from .overpass_transport import download_overpass
 
 
 @dataclass
@@ -56,8 +55,7 @@ class OsmSearchGeometryService:
     CACHE_VERSION = "osm_search_geometry_v3_robust"
     FALLBACK_ENDPOINTS = (
         "https://overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
-        "https://overpass.nchc.org.tw/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
     )
 
     TAG_FILTERS = {
@@ -348,7 +346,7 @@ class OsmSearchGeometryService:
     @staticmethod
     def _geometry_type(geometry):
         try:
-            return {0: "POINT", 1: "LINE", 2: "POLYGON"}.get(int(geometry.type()), "UNKNOWN")
+            return {0: "POINT", 1: "LINE", 2: "POLYGON"}.get(enum_value(geometry.type()), "UNKNOWN")
         except Exception:
             return "UNKNOWN"
 
@@ -430,47 +428,7 @@ class OsmSearchGeometryService:
         return clone
 
     def _download(self, query):
-        errors = []
-        endpoint_used = ""
-        from urllib.parse import quote_plus
-        body = QByteArray(("data=" + quote_plus(query)).encode("utf-8"))
-        for index, endpoint in enumerate(self.endpoints[:2]):
-            endpoint_used = endpoint
-            try:
-                request = QNetworkRequest(QUrl(endpoint))
-                try:
-                    request.setTransferTimeout((self.timeout_s + 1) * 1000)
-                except Exception:
-                    pass
-                request.setHeader(QNetworkRequest.ContentTypeHeader, "application/x-www-form-urlencoded; charset=UTF-8")
-                blocking = QgsBlockingNetworkRequest()
-                result = blocking.post(request, body, forceRefresh=True)
-                if result != QgsBlockingNetworkRequest.NoError:
-                    errors.append(blocking.errorMessage() or f"Errore richiesta {endpoint}")
-                    continue
-                reply = blocking.reply()
-                if reply is None:
-                    errors.append(f"Risposta assente da {endpoint}")
-                    continue
-                status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-                try:
-                    status = int(status)
-                except Exception:
-                    status = 200
-                if status >= 400:
-                    errors.append(f"HTTP {status} da {endpoint}")
-                    continue
-                raw = bytes(reply.content())
-                if not raw:
-                    errors.append(f"Risposta vuota da {endpoint}")
-                    continue
-                try:
-                    return json.loads(raw.decode("utf-8")), None, endpoint
-                except Exception as exc:
-                    errors.append(f"JSON non valido da {endpoint}: {exc}")
-            except Exception as exc:
-                errors.append(f"{endpoint}: {exc}")
-        return None, "Download Overpass fallito: " + " | ".join(errors[-2:]), endpoint_used
+        return download_overpass(query, self.endpoints, self.timeout_s)
 
     def _cache_path(self, name, canonical_type, lon, lat, radius, query):
         base = os.path.join(QgsApplication.qgisSettingsDirPath(), "geolichen_cache", "osm_search_geometry")

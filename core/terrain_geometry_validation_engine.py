@@ -23,6 +23,7 @@ except Exception:  # pragma: no cover
     np = None
 
 try:  # QGIS remains optional for isolated tests.
+    from .qgis_compat import GeometryType
     from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes
 except Exception:  # pragma: no cover
     QgsGeometry = None
@@ -104,7 +105,7 @@ class TerrainGeometryValidationEngine:
             pass
         if QgsWkbTypes is not None:
             try:
-                if QgsWkbTypes.geometryType(geometry.wkbType()) != QgsWkbTypes.PolygonGeometry:
+                if QgsWkbTypes.geometryType(geometry.wkbType()) != GeometryType.Polygon:
                     return False, "La geometria non è poligonale"
             except Exception:
                 pass

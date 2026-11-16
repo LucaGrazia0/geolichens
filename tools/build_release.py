@@ -21,24 +21,37 @@ SOURCE_DIRS = {
     "controllers", "core", "gui", "models", "services", "docs", "tools", "tests",
 }
 TEXT_SUFFIXES = {".py", ".md"}
+ASSET_FILES = {"gui/icons/locality_centroid.png"}
 MAX_BYTES = 25_000_000
 
 
 def source_files():
     """Use an allowlist so local datasets and build products cannot leak in."""
+    candidates = [ROOT / name for name in ROOT_FILES | ASSET_FILES]
+    for folder in sorted(SOURCE_DIRS):
+        base = ROOT / folder
+        if base.is_symlink():
+            raise ValueError(f"Source folder is a symlink: {folder}")
+        candidates.extend(base.rglob("*"))
     files = []
-    for path in sorted(ROOT.rglob("*")):
+    for path in sorted(set(candidates)):
         relative = path.relative_to(ROOT)
-        if (not path.is_file() or path.is_symlink()
-                or any(part.startswith(".") or part == "__pycache__"
-                       for part in relative.parts)):
+        if (not path.is_file() or any((ROOT.joinpath(*relative.parts[:i])).is_symlink()
+                                    for i in range(1, len(relative.parts) + 1))
+                or any(part.startswith(".") or part == "__pycache__" for part in relative.parts)):
             continue
-        if relative.as_posix() in ROOT_FILES:
+        if relative.as_posix() in ROOT_FILES | ASSET_FILES:
             files.append(path)
-        elif (relative.parts[0] in SOURCE_DIRS
-              and path.suffix in TEXT_SUFFIXES):
+        elif relative.parts[0] in SOURCE_DIRS and path.suffix in TEXT_SUFFIXES:
             files.append(path)
     return files
+
+
+# Development configuration belongs in the public source export, not the QGIS ZIP.
+REPOSITORY_FILES = {
+    ".gitignore", ".pre-commit-config.yaml", "pyproject.toml", "CONTRIBUTING.md",
+    "requirements/development.txt", ".github/workflows/checks.yml",
+}
 
 
 def validate(files, preview=False):
@@ -47,7 +60,7 @@ def validate(files, preview=False):
     meta = parser["general"]
     errors = []
     names = {p.relative_to(ROOT).as_posix() for p in files}
-    for name in ROOT_FILES:
+    for name in ROOT_FILES | ASSET_FILES:
         if name not in names:
             errors.append(f"Missing required file: {name}")
     for key in ("name", "description", "version", "qgisMinimumVersion",
@@ -68,6 +81,10 @@ def validate(files, preview=False):
         errors.append("Version cannot be used safely as a filename")
     for path in files:
         try:
+            if path.relative_to(ROOT).as_posix() in ASSET_FILES:
+                if not path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
+                    errors.append(f"Invalid PNG asset: {path.relative_to(ROOT)}")
+                continue
             text = path.read_text(encoding="utf-8")
             if path.suffix == ".py":
                 compile(text, str(path.relative_to(ROOT)), "exec")
@@ -134,7 +151,13 @@ def build(preview=False, source_dir=None):
             target = destination / name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
-        shutil.copyfile(ROOT / ".gitignore", destination / ".gitignore")
+        for name in sorted(REPOSITORY_FILES):
+            source = ROOT / name
+            if not source.is_file() or source.is_symlink():
+                raise ValueError(f"Missing/unsafe repository configuration: {name}")
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
     print(json.dumps({k: v for k, v in report.items() if k != "files"}, indent=2))
     print(archive)
     print(manifest_path)

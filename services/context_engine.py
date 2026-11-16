@@ -85,7 +85,7 @@ class ContextEngine:
             return None
         if v in {"passo", "forcella", "sella", "bocchetta"}:
             return "pass"
-        if v in {"monte", "cima", "vetta", "corno", "pizzo", "punta", "colle"}:
+        if v in {"monte", "cima", "vetta", "corno", "pizzo", "punta", "colle", "summit_peak", "peak"}:
             return "summit"
         if v in {"rifugio", "malga", "bivacco", "baita"}:
             return "refuge_malga"

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""GeoLichen 4.5a scoring engine.
+"""GeoLichen evidence-aware scoring engine.
 
 Architettura ufficiale:
 - Geographic Score: 25%
@@ -19,13 +19,13 @@ ma non costituisce più un macro-score autonomo.
 I vecchi componenti restano esportati come diagnostica legacy.
 """
 
-import re
+from .environmental_evidence_service import EnvironmentalEvidenceService
 
 from ._shared_geo_utils import to_float as _shared_to_float
 
 
 class ScoringModel:
-    """Motore ufficiale GeoLichen 4.5a."""
+    """Official scoring, with candidate observations and proxy provenance."""
 
     MACRO_WEIGHTS = {
         "geographic": 25.0,
@@ -81,24 +81,7 @@ class ScoringModel:
             self._to_float(env.get("record_score"), 50.0)
         )
 
-        altitude_score = 50.0
-        alt_delta = self._to_float(env.get("alt_delta_m"))
-        tolerance = self._to_float(
-            env.get("altitude_tolerance_m"), 100.0
-        ) or 100.0
-
-        if alt_delta is not None:
-            distance = abs(alt_delta)
-            if distance <= tolerance:
-                altitude_score = 100.0
-            elif distance <= tolerance * 1.5:
-                altitude_score = 75.0
-            elif distance <= tolerance * 2.0:
-                altitude_score = 50.0
-            else:
-                altitude_score = 20.0
-        elif env.get("altitude") is not None:
-            altitude_score = 70.0
+        altitude_score = self.altitude_score(env)
 
         environmental_score = 50.0
         soil_confidence = self._to_float(env.get("soil_confidence_score"))
@@ -135,10 +118,14 @@ class ScoringModel:
         )
 
         aspect_bonus = self._to_float(env.get("aspect_bonus"), 0.0) or 0.0
-        aspect_score = self._clamp(50.0 + aspect_bonus * 10.0)
+        aspect_score = (self._clamp(50.0 + aspect_bonus * 10.0)
+                        if self._to_float(env.get("aspect")) is not None and env.get("record_aspect")
+                        else None)
 
         slope_penalty = self._to_float(env.get("slope_penalty"), 0.0) or 0.0
-        slope_score = self._clamp(100.0 + slope_penalty * 10.0)
+        slope_score = (self._clamp(100.0 + slope_penalty * 10.0)
+                       if self._to_float(env.get("slope")) is not None
+                       and self._to_float(env.get("slope_penalty")) is not None else None)
 
         return {
             "record": record_score,
@@ -153,6 +140,33 @@ class ScoringModel:
     def component_scores(self, env):
         """Alias storico per compatibilità."""
         return self.legacy_component_scores(env)
+
+    def altitude_score(self, env):
+        """Continuous compatibility, separate from the record's hard filter.
+
+        Every elevation inside a stated interval is equally compatible. For a
+        single value, distance is measured from that value. At one tolerance
+        beyond the value/interval the score is neutral (50). This is an
+        explicit model heuristic, not a calibrated probability.
+        """
+        env = env or {}
+        altitude = self._to_float(env.get("altitude"))
+        low = self._to_float(env.get("record_altitude_min"))
+        high = self._to_float(env.get("record_altitude_max"))
+        record = self._to_float(env.get("record_altitude"))
+        if altitude is not None and low is not None and high is not None:
+            low, high = sorted((low, high))
+            delta = max(low - altitude, altitude - high, 0.0)
+        elif altitude is not None and record is not None:
+            delta = abs(altitude - record)
+        else:
+            delta = self._to_float(env.get("alt_delta_m"))
+        if delta is None:
+            return None
+        tolerance = self._to_float(env.get("altitude_tolerance_m"), 100.0)
+        if tolerance is None or tolerance <= 0:
+            tolerance = 100.0
+        return self._clamp(100.0 - 50.0 * abs(delta) / tolerance)
 
     # ------------------------------------------------------------------
     # Quattro macro-score ufficiali 4.5a.
@@ -172,23 +186,13 @@ class ScoringModel:
     def terrain_score(self, env, components=None):
         """Quota, esposizione e pendenza, aggregate una sola volta."""
         components = components or self.legacy_component_scores(env)
-        return self._weighted_average(
-            [
-                (
-                    components.get("altitude"),
-                    self.TERRAIN_WEIGHTS["altitude"],
-                ),
-                (
-                    components.get("aspect"),
-                    self.TERRAIN_WEIGHTS["aspect"],
-                ),
-                (
-                    components.get("slope"),
-                    self.TERRAIN_WEIGHTS["slope"],
-                ),
-            ],
-            default=50.0,
-        )
+        # Fixed weights keep missing measurements neutral for every candidate.
+        total_weight = sum(self.TERRAIN_WEIGHTS.values())
+        return self._clamp(50.0 + sum(
+            weight * (components[key] - 50.0)
+            for key, weight in self.TERRAIN_WEIGHTS.items()
+            if components.get(key) is not None
+        ) / total_weight)
 
     def _lower_text(self, value):
         try:
@@ -286,239 +290,57 @@ class ScoringModel:
         return expected
 
     def _environmental_components_for_group(self, env, group):
-        """Sottocomponenti Environmental 4.5b.2, availability-aware.
+        """Aggregate explicit evidence with fixed weights and neutral missing data.
 
-        Un valore mancante non viene più trasformato automaticamente in 50.
-        Le componenti non valutabili sono marcate N/A ed escluse dalla media;
-        i pesi delle sole componenti disponibili sono rinormalizzati a 100%.
-        Un valore 50 resta possibile solo quando esiste un'evidenza realmente
-        neutra o non discriminante.
+        Requirements never count as observations. Proxy quality reduces a
+        contribution toward 50; it is not a probability of correctness.
         """
         env = env or {}
-        group = group if group in ("soil", "rock", "epiphyte", "lignicolous", "moss", "unknown") else "unknown"
-
-        constraints = self._lower_text(env.get("constraints"))
-        observed_substrate = self._lower_text(env.get("substrate"))
-        details = self._lower_text(env.get("details"))
-        soil_reason = self._lower_text(env.get("soil_confidence_reason"))
-        ph_reason = self._lower_text(env.get("ph_reason"))
-        tree_reason = self._lower_text(env.get("tree_match_reason"))
-
-        values = {}
-        status = {}
-        reasons = {}
-
-        # 1) Substrato
-        substrate_available = bool(observed_substrate) or self._contains_any(
-            details, ["substrato compatibile", "substrato non ideale", "substrato incompatibile"]
-        )
-        substrate_score = None
-        if substrate_available:
-            substrate_score = 70.0 if observed_substrate else 50.0
-            reason = f"substrato osservato: {observed_substrate}" if observed_substrate else "evidenza registrata nei dettagli"
-            if "substrato compatibile" in details:
-                substrate_score, reason = 100.0, "substrato esplicitamente compatibile"
-            elif "substrato non ideale" in details or "substrato incompatibile" in details:
-                substrate_score, reason = 40.0, "substrato non ideale o incompatibile"
-            elif group in ("epiphyte", "lignicolous"):
-                substrate_score, reason = None, "substrato GIS del terreno non applicabile al substrato legnoso del record"
-            status["substrate"] = "non valutato" if substrate_score is None else "valutato"
-            reasons["substrate"] = reason
-        else:
-            status["substrate"] = "non valutato"
-            reasons["substrate"] = "nessuna evidenza di substrato disponibile"
-        values["substrate"] = None if substrate_score is None else self._clamp(substrate_score)
-
-        # 2) Litologia
-        rock_type = self._lower_text(env.get("rock_type"))
-        rock_raw = self._lower_text(env.get("rock_raw"))
-        lithology_available = bool(rock_type or rock_raw) or "litologia" in details
-        lithology_score = None
-        if lithology_available:
-            lithology_score = 65.0 if (rock_type or rock_raw) else 50.0
-            reason = f"litologia osservata: {rock_type or rock_raw}" if (rock_type or rock_raw) else "evidenza litologica registrata"
-            if "litologia compatibile" in details:
-                lithology_score, reason = 100.0, "litologia esplicitamente compatibile"
-            elif "litologia richiesta ma dato gis assente" in details:
-                lithology_score, reason = 50.0, "preferenza presente, ma dato GIS non discriminante"
-            elif "litologia" in details and any(term in details for term in ["incompatibile", "non compatibile"]):
-                lithology_score, reason = 30.0, "litologia incompatibile"
-            if group in ("epiphyte", "lignicolous"):
-                lithology_score, reason = None, "litologia del terreno non applicabile al substrato legnoso del record"
-            status["lithology"] = "non valutato" if lithology_score is None else "valutato"
-            reasons["lithology"] = reason
-        else:
-            status["lithology"] = "non valutato"
-            reasons["lithology"] = "layer o evidenza litologica non disponibile"
-        values["lithology"] = None if lithology_score is None else self._clamp(lithology_score)
-
-        # 3) pH
-        ph_bonus = self._to_float(env.get("ph_score"), self._to_float(env.get("litho_soil_ph_score")))
-        ph_available = ph_bonus is not None or bool(ph_reason or soil_reason)
-        ph_score = None
-        if ph_available:
-            ph_score = 50.0
-            reason = ph_reason or soil_reason or "evidenza pH disponibile"
-            if ph_bonus is not None and "nessuna preferenza" not in reason:
-                ph_score = self._clamp(50.0 + ph_bonus * 4.0)
-            if "dentro range preferito" in ph_reason:
-                ph_score = max(ph_score, 85.0)
-            if group in ("epiphyte", "lignicolous") and "corteccia" not in tree_reason and "bark" not in tree_reason:
-                ph_score, reason = None, "pH del suolo non applicabile al pH della corteccia"
-            status["ph"] = "non valutato" if ph_score is None else "valutato"
-            reasons["ph"] = reason
-        else:
-            status["ph"] = "non valutato"
-            reasons["ph"] = "nessuna evidenza o preferenza pH disponibile"
-        values["ph"] = None if ph_score is None else self._clamp(ph_score)
-
-        # 4) Habitat
-        habitat_terms = ["habitat=", "bosco", "alpino", "rupicolo", "prateria", "torbiera"]
-        habitat_available = "coerenza habitat" in details or self._contains_any(constraints, habitat_terms)
-        habitat_score = None
-        if habitat_available:
-            habitat_score = 60.0 if self._contains_any(constraints, habitat_terms) else 50.0
-            reason = "vincolo o contesto habitat disponibile"
-            if "coerenza habitat" in details:
-                habitat_score, reason = 75.0, "coerenza habitat esplicitamente registrata"
-                match = re.search(r"coerenza habitat[^\(]*\(([-+]?\d+(?:\.\d+)?)\)", details)
-                if match:
-                    try:
-                        bonus = float(match.group(1))
-                        habitat_score = self._clamp(55.0 + bonus * 4.0)
-                        reason = f"coerenza habitat con bonus {bonus:g}"
-                    except Exception:
-                        pass
-            status["habitat"] = "valutato"
-            reasons["habitat"] = reason
-        else:
-            status["habitat"] = "non valutato"
-            reasons["habitat"] = "nessuna evidenza tecnica di habitat registrata"
-        values["habitat"] = None if habitat_score is None else self._clamp(habitat_score)
-
-        # 5) Albero / foresta
-        tree_match = max(0.0, self._to_float(env.get("tree_match_score"), 0.0) or 0.0)
-        forest_bonus = max(0.0, self._to_float(env.get("forest_dist_score"), 0.0) or 0.0)
-        forest_dist = self._to_float(env.get("forest_dist_m"))
-        expected_tree = self._lower_text(env.get("expected_tree"))
-        observed_tree = self._lower_text(env.get("observed_tree"))
-        forest_category = self._lower_text(env.get("forest_category"))
-        tree_available = any([tree_match > 0, forest_bonus > 0, forest_dist is not None, expected_tree, observed_tree, forest_category, tree_reason])
-        tree_score = None
-        if tree_available:
-            tree_score = 50.0
-            reason = "evidenza forestale disponibile ma non discriminante"
-            explicit_tree_expected = bool(expected_tree)
-            exact_tree_match = bool(explicit_tree_expected and observed_tree and (expected_tree == observed_tree or expected_tree in observed_tree or observed_tree in expected_tree))
-            if exact_tree_match:
-                tree_score, reason = 100.0, "forofita attesa confermata"
-            elif tree_match > 0:
-                tree_score, reason = self._clamp(50.0 + tree_match * 2.5), "corrispondenza arborea parziale"
-            if group == "epiphyte" and explicit_tree_expected and observed_tree and not exact_tree_match:
-                tree_score, reason = max(tree_score, 58.0), "presenza arborea confermata, forofita specifica non confermata"
-            if group == "lignicolous" and forest_dist is not None:
-                # Per legno morto/ceppaie la copertura forestale è un proxy del
-                # contesto adatto, non una prova diretta della presenza di deadwood.
-                # Curva continua e più prudente rispetto agli epifiti.
-                d = max(0.0, float(forest_dist))
-                if d <= 25.0:
-                    proposed = 92.0
-                elif d <= 100.0:
-                    proposed = 92.0 - ((d - 25.0) / 75.0) * 12.0
-                elif d <= 250.0:
-                    proposed = 80.0 - ((d - 100.0) / 150.0) * 25.0
-                elif d <= 500.0:
-                    proposed = 55.0 - ((d - 250.0) / 250.0) * 25.0
-                elif d <= 1000.0:
-                    proposed = 30.0 - ((d - 500.0) / 500.0) * 18.0
-                else:
-                    proposed = 10.0
-                tree_score = proposed
-                reason = f"distanza dal contesto forestale: {forest_dist:.1f} m; proxy lignicolo={proposed:.1f}"
-            elif group == "epiphyte" and forest_dist is not None:
-                # Score assoluto e continuo: la distanza deve poter penalizzare,
-                # non soltanto aggiungere un bonus sopra il valore neutro 50.
-                d = max(0.0, float(forest_dist))
-                if d <= 25.0:
-                    proposed = 100.0
-                elif d <= 100.0:
-                    proposed = 100.0 - ((d - 25.0) / 75.0) * 15.0
-                elif d <= 250.0:
-                    proposed = 85.0 - ((d - 100.0) / 150.0) * 35.0
-                elif d <= 500.0:
-                    proposed = 50.0 - ((d - 250.0) / 250.0) * 30.0
-                elif d <= 1000.0:
-                    proposed = 20.0 - ((d - 500.0) / 500.0) * 15.0
-                else:
-                    proposed = 5.0
-
-                # Una forofita esatta confermata resta evidenza più forte della
-                # distanza dal poligono forestale; negli altri casi prevale lo
-                # score spaziale, che può scendere sotto 50.
-                if not exact_tree_match:
-                    tree_score = proposed
-                reason = f"distanza dalla copertura forestale: {forest_dist:.1f} m; score epifita={proposed:.1f}"
-            if group == "epiphyte" and not explicit_tree_expected and (forest_category or observed_tree):
-                tree_score, reason = max(tree_score, 70.0), "copertura arborea generica confermata"
-            elif group == "lignicolous" and forest_dist is None and (forest_category or observed_tree):
-                tree_score, reason = max(tree_score, 68.0), "contesto forestale disponibile; presenza di legno morto non verificata"
-            elif group not in ("epiphyte", "lignicolous") and (forest_category or observed_tree):
-                tree_score, reason = max(tree_score, 65.0), "presenza arborea/forestale nel contesto"
-            status["tree_forest"] = "valutato"
-            reasons["tree_forest"] = reason
-        else:
-            status["tree_forest"] = "non valutato"
-            reasons["tree_forest"] = "nessun dato su alberi o copertura forestale"
-        values["tree_forest"] = None if tree_score is None else self._clamp(tree_score)
-
+        evaluator = EnvironmentalEvidenceService()
+        evidence = env.get("ecological_evidence")
+        if not isinstance(evidence, dict):
+            evidence = evaluator.evaluate(env, env.get("constraints") or {})
         weights_by_group = {
-            "epiphyte": {"substrate": 0.0, "lithology": 0.0, "ph": 0.0, "habitat": 25.0, "tree_forest": 75.0},
-            "lignicolous": {"substrate": 0.0, "lithology": 0.0, "ph": 0.0, "habitat": 35.0, "tree_forest": 65.0},
-            "rock": {"substrate": 30.0, "lithology": 30.0, "ph": 15.0, "habitat": 20.0, "tree_forest": 5.0},
-            "soil": {"substrate": 30.0, "lithology": 15.0, "ph": 25.0, "habitat": 25.0, "tree_forest": 5.0},
-            "moss": {"substrate": 35.0, "lithology": 10.0, "ph": 15.0, "habitat": 30.0, "tree_forest": 10.0},
-            "unknown": {"substrate": 30.0, "lithology": 20.0, "ph": 15.0, "habitat": 20.0, "tree_forest": 15.0},
+            "epiphyte": {"substrate": 0., "lithology": 0., "ph": 0., "habitat": 25., "tree_forest": 75.},
+            "lignicolous": {"substrate": 0., "lithology": 0., "ph": 0., "habitat": 35., "tree_forest": 65.},
+            "rock": {"substrate": 30., "lithology": 30., "ph": 0., "habitat": 20., "tree_forest": 0.},
+            "soil": {"substrate": 30., "lithology": 15., "ph": 25., "habitat": 25., "tree_forest": 0.},
+            "moss": {"substrate": 35., "lithology": 10., "ph": 15., "habitat": 30., "tree_forest": 0.},
+            "unknown": {"substrate": 30., "lithology": 20., "ph": 0., "habitat": 20., "tree_forest": 0.},
         }
-        nominal_weights = weights_by_group[group]
-        available = [key for key, value in values.items() if value is not None]
-        available_weight = sum(nominal_weights[key] for key in available)
-
-        # Per epifiti e lignicoli la sola prossimità alla foresta non deve
-        # assorbire automaticamente il peso delle evidenze mancanti. I pesi
-        # nominali restano quindi un tetto: albero/foresta vale al massimo 75%
-        # negli epifiti e 65% nei lignicoli. Per gli altri gruppi si conserva
-        # la rinormalizzazione storica delle componenti disponibili.
-        preserve_missing_weight = group in ("epiphyte", "lignicolous")
-        if preserve_missing_weight:
-            effective_weights = {
-                key: (nominal_weights[key] if key in available else 0.0)
-                for key in values
-            }
-        else:
-            effective_weights = {
-                key: (nominal_weights[key] * 100.0 / available_weight if key in available and available_weight > 0 else 0.0)
-                for key in values
-            }
-
-        if available_weight > 0:
-            total = sum(values[key] * effective_weights[key] for key in available) / 100.0
-            method = "nominal_weights_missing_not_redistributed" if preserve_missing_weight else "available_components_renormalized"
-        else:
-            italic = self._to_float(env.get("ecological_score"))
-            total = self._clamp(italic) if italic is not None else 50.0
-            method = "italic_fallback" if italic is not None else "neutral_fallback"
-
-        contributions = {key: (None if values[key] is None else values[key] * effective_weights[key] / 100.0) for key in values}
+        group = group if group in weights_by_group else "unknown"
+        original_weights = weights_by_group[group]
+        total_weight = sum(original_weights.values())
+        weights = {key: weight * 100.0 / total_weight for key, weight in original_weights.items()}
+        values, status, reasons, qualities, sources = {}, {}, {}, {}, {}
+        for key, weight in weights.items():
+            item = evidence.get(key) or {}
+            value = self._to_float(item.get("score"))
+            if weight <= 0:
+                value = None
+                status[key] = "non applicabile"
+            elif value is None:
+                status[key] = "mancante"
+            else:
+                status[key] = "valutato"
+            values[key] = None if value is None else self._clamp(value)
+            qualities[key] = (self._clamp(self._to_float(item.get("quality"), 1.0), 0.0, 1.0)
+                              if value is not None else 0.0)
+            reasons[key] = item.get("reason") or "Dato del candidato non disponibile"
+            sources[key] = item.get("source") or ""
+        effective = {key: weights[key] * qualities[key] for key in weights}
+        neutral = 50.0 * (1.0 - sum(effective.values()) / 100.0)
+        contributions = {key: (None if values[key] is None else values[key] * effective[key] / 100.0)
+                         for key in weights}
+        total = neutral + sum(value for value in contributions.values() if value is not None)
         return {
-            "score": self._clamp(total),
-            "group": group,
-            "weights": nominal_weights,
-            "effective_weights": effective_weights,
-            "components": values,
-            "status": status,
-            "reasons": reasons,
-            "contributions": contributions,
-            "method": method,
+            "score": self._clamp(total), "group": group, "weights": weights,
+            "effective_weights": effective, "components": values, "status": status,
+            "reasons": reasons, "contributions": contributions, "sources": sources,
+            "qualities": qualities, "neutral_contribution": neutral,
+            "coverage": sum(weights[key] for key in weights if values[key] is not None),
+            "quality_coverage": sum(effective.values()),
+            "method": "fixed_weights_neutral_missing_proxy_quality",
         }
 
     def environment_score_soil(self, env):
@@ -561,36 +383,35 @@ class ScoringModel:
         return result
 
     def environmental_score(self, env, components=None):
-        """Environmental 4.5b: substrato, litologia, pH, habitat e foresta.
-
-        Il valore è costruito da sottocomponenti esplicite. La carta forestale
-        fornisce evidenza positiva per epifiti/lignicoli, mentre la sua assenza
-        resta neutra per rispettare alberi isolati e microhabitat non mappati.
-        """
+        """Fixed applicable weights; missing evidence stays neutral at 50."""
         result = self._environmental_components(env)
         return self._clamp(result.get("score"), 0.0)
 
     def accessibility_score(self, env, components=None):
-        """Plausibilità di accesso tramite sentieri, piste e contesto."""
+        """Plausibilità di accesso tramite sentieri e piste, senza geografia."""
         components = components or self.legacy_component_scores(env)
-        return self._clamp(components.get("accessibility"), 50.0)
+        value = components.get("accessibility")
+        return self._clamp(value if value is not None else 50.0)
 
     # Alias usato dalla versione bridge.
     def accessibility_macro_score(self, env, components=None):
         return self.accessibility_score(env, components)
 
-    def macro_scores(self, env):
+    def macro_scores(self, env, environmental_result=None):
         components = self.legacy_component_scores(env)
+        if environmental_result is None:
+            environmental_result = self._environmental_components(env)
         return {
             "geographic": self.geographic_score(env, components),
             "terrain": self.terrain_score(env, components),
-            "environmental": self.environmental_score(env, components),
+            "environmental": environmental_result["score"],
             "accessibility": self.accessibility_score(env, components),
         }
 
     def final_score(self, env):
         """Unica funzione obiettivo ufficiale GeoLichen 4.5a."""
-        macro = self.macro_scores(env)
+        environmental_result = self._environmental_components(env)
+        macro = self.macro_scores(env, environmental_result=environmental_result)
         contributions = {}
         total = 0.0
 
@@ -610,7 +431,8 @@ class ScoringModel:
             "weights": dict(self.MACRO_WEIGHTS),
             "used": contributions,
             "legacy_components": self.legacy_component_scores(env),
-            "architecture_version": "4.5c-context-pipelines",
+            "environmental_result": environmental_result,
+            "architecture_version": "4.7-independent-evidence",
         }
 
     def normalized_score(self, env):
@@ -631,19 +453,21 @@ class ScoringModel:
         env["norm_score"] = final
         env["heat_w"] = final
         env["scoring_architecture"] = result.get(
-            "architecture_version", "4.5c-context-pipelines"
+            "architecture_version", "4.7-independent-evidence"
         )
 
         env["geographic_score"] = macro.get("geographic")
         env["terrain_macro_score"] = macro.get("terrain")
         env["environmental_score"] = macro.get("environmental")
-        env_result = self._environmental_components(env)
+        env_result = result["environmental_result"]
         env["environmental_score_raw"] = env_result.get("score")
         env["environmental_score_method"] = env_result.get("method")
-        env["environmental_available_weight"] = sum(
-            value for key, value in (env_result.get("weights") or {}).items()
-            if (env_result.get("components") or {}).get(key) is not None
-        )
+        env["environmental_available_weight"] = env_result["coverage"]
+        env["environmental_quality_coverage"] = env_result["quality_coverage"]
+        env["environmental_neutral_contribution"] = env_result["neutral_contribution"]
+        env["environmental_sources"] = dict(env_result["sources"])
+        env["environmental_qualities"] = dict(env_result["qualities"])
+        env["environmental_evidence_status"] = dict(env_result["status"])
         env["environmental_group"] = env_result.get("group")
         env["environmental_pipeline"] = env_result.get("pipeline")
         env["primary_pipeline"] = env_result.get("pipeline")
@@ -707,5 +531,9 @@ class ScoringModel:
             parts.append(f"pesi macro: {env.get('norm_weights')}")
         if env.get("score_components"):
             parts.append(f"macro-componenti: {env.get('score_components')}")
+        if env.get("environmental_available_weight") is not None:
+            parts.append(f"copertura evidenze ambientali={env['environmental_available_weight']:.1f}%; "
+                         f"ponderata per qualità={env['environmental_quality_coverage']:.1f}%; "
+                         f"contributo neutro={env['environmental_neutral_contribution']:.1f}")
 
         return "; ".join(parts)

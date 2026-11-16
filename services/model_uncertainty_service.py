@@ -12,7 +12,7 @@ from qgis.core import (
 class ModelUncertaintyService:
     """Stima la concentrazione spaziale dei candidati GeoLichen.
 
-    Questa misura descrive il comportamento del modello (R55-S70) e non deve
+    Questa misura descrive il comportamento del modello (R55-S65) e non deve
     essere esportata come ``coordinateUncertaintyInMeters``.
     """
 
@@ -28,8 +28,10 @@ class ModelUncertaintyService:
         center_score,
         center_row=None,
         grid_step_m=100,
+        distance_func=None,
     ):
         features_data = features_data or []
+        distance_func = distance_func or self.make_distance_func()
         grid_step_m = self._positive_float(grid_step_m, 100.0)
         buffer_radius = self._equivalent_radius_m(buffer_geom)
         candidate_resolution = max(1.0, grid_step_m / math.sqrt(2.0))
@@ -38,10 +40,7 @@ class ModelUncertaintyService:
         minimum_radius = candidate_resolution
 
         if not features_data:
-            fallback = (
-                min(buffer_radius * self.MAX_MODEL_RADIUS_BUFFER_RATIO, buffer_radius)
-                if buffer_radius else grid_step_m
-            )
+            fallback = buffer_radius if buffer_radius else grid_step_m
             fallback = max(minimum_radius, fallback)
             return {
                 "model_radius_m": round(float(fallback), 1),
@@ -71,7 +70,7 @@ class ModelUncertaintyService:
         distance_rows = []
         if center_point is not None:
             for row in compatible:
-                distance = self.distance_m(center_point, row.get("point"))
+                distance = distance_func(center_point, row.get("point"))
                 score = self._to_float(row.get("score"))
                 if distance is None or score is None:
                     continue
@@ -181,18 +180,25 @@ class ModelUncertaintyService:
         return {"model_confidence": label, "model_confidence_score": round(numeric, 1)}
 
     def distance_m(self, pt1_wgs84, pt2_wgs84):
-        try:
-            if not pt1_wgs84 or not pt2_wgs84:
+        return self.make_distance_func()(pt1_wgs84, pt2_wgs84)
+
+    def make_distance_func(self):
+        """One ellipsoidal measurer per analysis, never a process-wide cache."""
+        distance = QgsDistanceArea()
+        distance.setSourceCrs(
+            QgsCoordinateReferenceSystem("EPSG:4326"),
+            QgsProject.instance().transformContext(),
+        )
+        distance.setEllipsoid("WGS84")
+
+        def measure(pt1_wgs84, pt2_wgs84):
+            try:
+                if pt1_wgs84 is None or pt2_wgs84 is None:
+                    return None
+                return float(distance.measureLine(QgsPointXY(pt1_wgs84), QgsPointXY(pt2_wgs84)))
+            except Exception:
                 return None
-            distance = QgsDistanceArea()
-            distance.setSourceCrs(
-                QgsCoordinateReferenceSystem("EPSG:4326"),
-                QgsProject.instance().transformContext(),
-            )
-            distance.setEllipsoid("WGS84")
-            return float(distance.measureLine(QgsPointXY(pt1_wgs84), QgsPointXY(pt2_wgs84)))
-        except Exception:
-            return None
+        return measure
 
     def _equivalent_radius_m(self, geom_wgs84):
         try:

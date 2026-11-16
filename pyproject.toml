@@ -1,0 +1,8 @@
+[tool.ruff]
+target-version = "py39"
+include = ["*.py"]
+extend-exclude = ["dist", "output", "data", "knowledge", "readme and change"]
+
+[tool.ruff.lint]
+# Start with correctness errors, avoiding a repository-wide formatting rewrite.
+select = ["E9", "F821", "F822", "F823"]

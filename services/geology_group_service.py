@@ -1,5 +1,5 @@
+from ..core.qgis_compat import FieldType
 from qgis.core import QgsField, QgsFeatureRequest
-from qgis.PyQt.QtCore import QVariant
 
 from .lithology_classifier_service import LithologyClassifierService
 
@@ -33,7 +33,7 @@ class GeologyGroupService:
             started_edit = True
 
         if target_field not in field_names:
-            ok = layer.addAttribute(QgsField(target_field, QVariant.String, len=20))
+            ok = layer.addAttribute(QgsField(target_field, FieldType.String, len=20))
             if not ok:
                 raise ValueError('Impossibile creare il campo GRUPPO_LITO')
             layer.updateFields()
@@ -70,7 +70,8 @@ class GeologyGroupService:
     def _auto_source_field(self, layer):
         hints = [
             'GRUPPO_LITO', 'LITOLOGIA', 'DESCRIZIONE', 'DESCRIZION', 'UNITA',
-            'FORMAZIONE', 'DESCR', 'NOME', 'SIGLA'
+            'FORMAZIONE', 'DESCR', 'NOME', 'SIGLA', 'LITHOLOGY',
+            'ROCK_TYPE', 'DESCRIPTION', 'FORMATION', 'GEOLOGY', 'UNIT', 'ROCK'
         ]
         names = [f.name() for f in layer.fields()]
         for h in hints:

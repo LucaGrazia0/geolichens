@@ -4,6 +4,7 @@ This service documents the geographic georeference independently from the
 GeoLichen ecological point. It does not alter GSS, ranking, candidate
 selection, DEM values, buffers, or heatmaps.
 """
+from ..core.enum_utils import enum_value
 
 from datetime import date
 import math
@@ -155,7 +156,7 @@ class GbifMetadataService:
             area = self._metric_area(original_extent, corrected_center)
             if area is None or area <= 0:
                 try:
-                    if original_extent.type() == 0 and original_extent.distance(
+                    if enum_value(original_extent.type()) == 0 and original_extent.distance(
                         QgsGeometry.fromPointXY(corrected_center)
                     ) == 0:
                         return 1.0

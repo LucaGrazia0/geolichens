@@ -1,3 +1,4 @@
+from ..core.enum_utils import enum_value
 from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry, QgsPointXY, QgsProject, QgsRectangle
 
 from ..core.locality_geometry_engine import LocalityGeometryEngine
@@ -6,7 +7,7 @@ from .semantic_search_buffer_service import SemanticSearchBufferService
 from .adaptive_buffer_decision_service import AdaptiveBufferDecisionService
 from .adaptive_search_geometry_engine import AdaptiveSearchGeometryEngine
 from .osm_search_geometry_service import OsmSearchGeometryService
-from .search_geometry_resolution_service import SearchGeometryResolutionService
+from .search_geometry_resolution_service import SearchGeometryResolutionResult, SearchGeometryResolutionService
 from ..core.geometry_resolution_engine import GeometryResolutionEngine
 from ..core.geometry_result import GeometryResult
 from ..core.geometry_context import GeoreferencingGeometryContext
@@ -78,7 +79,7 @@ class InitialBoundaryService:
         try:
             if geometry.isEmpty():
                 return "EMPTY"
-            return {0: "POINT", 1: "LINE", 2: "POLYGON"}.get(int(geometry.type()), "UNKNOWN")
+            return {0: "POINT", 1: "LINE", 2: "POLYGON"}.get(enum_value(geometry.type()), "UNKNOWN")
         except Exception:
             return "UNKNOWN"
 
@@ -122,7 +123,9 @@ class InitialBoundaryService:
             reasons.append("geocoder_bbox_missing")
         else:
             reasons.append("geocoder_bbox_available")
-        if osm is None:
+        if (search_resolution.metadata or {}).get("osm_lookup_skipped"):
+            reasons.append("osm_lookup_skipped_circle_policy")
+        elif osm is None:
             reasons.append("osm_lookup_no_result_object")
         elif not osm_success:
             reasons.append("osm_lookup_failed")
@@ -157,7 +160,7 @@ class InitialBoundaryService:
             "geocoder_bbox_height_m": bbox_h,
             "documented_geometry_source": str(documented_source or ""),
             "documented_geometry_type": documented_type,
-            "osm_lookup_attempted": True,
+            "osm_lookup_attempted": not bool((search_resolution.metadata or {}).get("osm_lookup_skipped")),
             "osm_lookup_success": osm_success,
             "osm_error": str(getattr(osm, "error", "") or (search_resolution.metadata or {}).get("osm_error") or "") if osm is not None else str((search_resolution.metadata or {}).get("osm_error") or ""),
             "osm_endpoint": str(getattr(osm, "endpoint", "") or "") if osm is not None else "",
@@ -571,7 +574,7 @@ class InitialBoundaryService:
         if "point_proxy" in source:
             return "point_proxy"
         try:
-            geom_type = int(documented.type()) if documented is not None else -1
+            geom_type = enum_value(documented.type()) if documented is not None else -1
         except Exception:
             geom_type = -1
         if geom_type == 2:
@@ -609,6 +612,25 @@ class InitialBoundaryService:
             if parsed > 0:
                 return parsed
         return None
+
+    def _circular_search_extent(self, feature, canonical_type):
+        """Create the requested circle at the selected locality's point.
+
+        Source rectangles/polygons remain documentary evidence. They do not
+        control the shape, center or radius of the operational search area.
+        """
+        center = self._point_from_feature(feature)
+        if center is None or center.isEmpty():
+            raise ValueError("Punto della località non disponibile per il buffer circolare")
+        plan = self.adaptive_search_geometry_engine.plan(
+            canonical_type,
+            decision="USE_POINT_BUFFER",
+            source_kind="geocoder_point",
+            source_accuracy_m=self._feature_accuracy_m(feature),
+        )
+        radius = float(plan.point_radius_m)
+        return (self._metric_buffer_in_wgs84(center, radius),
+                f"semantic_{canonical_type}_point_buffer_{radius:g}m")
 
     def resolve_locality(self, feature, ref_type="generic_toponym", locality_context=None):
         """Create the authoritative ``ResolvedLocality`` for this geocoder hit."""
@@ -684,15 +706,23 @@ class InitialBoundaryService:
                 },
                 stage="documented",
             )
-        # Workflow point 3 has one authoritative result.  OSM is tried first;
-        # the existing semantic geometry is the unchanged deterministic fallback.
-        search_resolution = self.search_geometry_resolution_service.resolve(
-            osm_builder=lambda: self._osm_search_extent(
-                feature, ref_type, semantic_type, interpretation=interpretation
-            ),
-            semantic_builder=lambda: self._search_extent(
-                feature, ref_type, semantic_type, bbox_geom
-            ),
+        # All locality searches use the selected geocoder point by explicit policy.
+        # Keep documentary geometry independent: no OSM polygon or provider
+        # rectangle may replace this operational circle, even when available.
+        search_type = self.search_buffer_service.canonical_type(
+            getattr(interpretation, "feature_type", None) or semantic_type or ref_type
+        )
+        search, search_strategy = self._circular_search_extent(feature, search_type)
+        search_resolution = SearchGeometryResolutionResult(
+            geometry=search,
+            strategy=search_strategy,
+            source="geocoder_point_buffer",
+            metadata={
+                "resolution_order": "circular_locality_policy",
+                "fallback_used": False,
+                "osm_lookup_skipped": True,
+                "center_source": "selected_geocoder_point",
+            },
         )
         search = search_resolution.geometry
         search_strategy = search_resolution.strategy
@@ -707,7 +737,7 @@ class InitialBoundaryService:
             plan_geometry_type = ""
         if not plan_geometry_type:
             try:
-                qgis_type = int(search.type()) if search is not None else -1
+                qgis_type = enum_value(search.type()) if search is not None else -1
             except Exception:
                 qgis_type = -1
             plan_geometry_type = {0: "POINT", 1: "LINE", 2: "POLYGON"}.get(qgis_type, "UNKNOWN")

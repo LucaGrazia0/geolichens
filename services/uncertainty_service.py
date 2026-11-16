@@ -1,7 +1,7 @@
 """Facade di compatibilita' per le due misure di incertezza GeoLichen.
 
 Fase 4-5:
-- ``ModelUncertaintyService`` calcola R55-S70 e confidence del modello;
+- ``ModelUncertaintyService`` calcola R55-S65 e confidence del modello;
 - ``GbifGeoreferencingService`` calcola coordinateUncertaintyInMeters;
 - questa classe mantiene la vecchia API per non alterare controller e ranking.
 """
@@ -47,6 +47,7 @@ class UncertaintyService:
         resolved_locality=None,
     ):
         features_data = features_data or []
+        distance_func = self.model_service.make_distance_func()
         default_row = features_data[0] if features_data else {}
         center_point = best_point if best_point is not None else default_row.get("point")
         center_score = self._to_float(selected_score)
@@ -57,7 +58,7 @@ class UncertaintyService:
             nearest = None
             nearest_distance = None
             for row in features_data:
-                distance = self.model_service.distance_m(center_point, row.get("point"))
+                distance = distance_func(center_point, row.get("point"))
                 if distance is None:
                     continue
                 if nearest_distance is None or distance < nearest_distance:
@@ -84,13 +85,14 @@ class UncertaintyService:
             center_score=center_score,
             center_row=center_row,
             grid_step_m=grid_step_m,
+            distance_func=distance_func,
         )
         confidence = self.confidence_service.evaluate(
             center_score=center_score,
             score_gap=model.get("score_gap"),
             features_data=features_data,
             center_point=center_point,
-            distance_func=self.model_service.distance_m,
+            distance_func=distance_func,
             model_radius_m=model.get("model_radius_m"),
             buffer_radius_m=model.get("buffer_radius_m"),
             compatible_points=model.get("compatible_points", 0),
@@ -102,7 +104,7 @@ class UncertaintyService:
             center_score=center_score,
             features_data=features_data,
             center_point=center_point,
-            distance_func=self.model_service.distance_m,
+            distance_func=distance_func,
             model_radius_m=model.get("model_radius_m"),
             grid_step_m=grid_step_m,
         )

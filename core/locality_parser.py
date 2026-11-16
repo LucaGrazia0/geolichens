@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Iterable, Pattern
 
 from .resolved_locality import LocalityInterpretation
+from .locality_names import name_variants
 
 
 @dataclass(frozen=True)
@@ -32,7 +33,7 @@ class SemanticLocalityParser:
         _Rule("peak", "POINT", 0.94, "peak", re.compile(r"\b(?:cima|vetta|pizzo|punta|corno)\b")),
         _Rule("pass", "POINT", 0.93, "pass", re.compile(r"\b(?:passo|forcella|sella|bocchetta)\b")),
         _Rule("valley", "POLYGON", 0.94, "valley", re.compile(r"\b(?:valle|val\s+d[' ]|val\s+di|val\s+)\b")),
-        _Rule("lake", "POLYGON", 0.94, "lake", re.compile(r"\b(?:lago|laguna|stagno|bacino)\b")),
+        _Rule("lake", "POLYGON", 0.94, "lake", re.compile(r"\b(?:lago|laghetto|laghetti|laguna|stagno|bacino)\b")),
         _Rule("river", "LINE", 0.91, "river", re.compile(r"\b(?:fiume|torrente|rio|rivo|canale)\b")),
         _Rule("glacier", "POLYGON", 0.94, "glacier", re.compile(r"\b(?:ghiacciaio|vedretta)\b")),
         _Rule("forest", "POLYGON", 0.94, "forest", re.compile(r"\b(?:foresta|bosco|selva)\b")),
@@ -55,6 +56,8 @@ class SemanticLocalityParser:
     @staticmethod
     def normalize(text: str | None) -> str:
         value = str(text or "").strip().replace("’", "'").replace("`", "'")
+        variants = name_variants(value)
+        value = variants[1] if len(variants) > 1 else value
         value = unicodedata.normalize("NFKD", value)
         value = "".join(ch for ch in value if not unicodedata.combining(ch))
         value = re.sub(r"\s+", " ", value.lower()).strip(" ,;.-")

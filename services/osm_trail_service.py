@@ -9,16 +9,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
 from typing import Optional
 
-from qgis.PyQt.QtCore import QByteArray, QUrl
-from qgis.PyQt.QtNetwork import QNetworkRequest
+from ..core.qgis_compat import FieldType, GeometryType
 from qgis.core import (
     QgsApplication,
-    QgsBlockingNetworkRequest,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeature,
@@ -27,10 +26,13 @@ from qgis.core import (
     QgsPointXY,
     QgsProject,
     QgsVectorLayer,
+    QgsCategorizedSymbolRenderer,
+    QgsRendererCategory,
+    QgsLineSymbol,
 )
-from qgis.PyQt.QtCore import QVariant
 
 from ._shared_geo_utils import local_metric_crs
+from .overpass_transport import download_overpass
 
 
 @dataclass
@@ -61,11 +63,10 @@ class OsmTrailService:
         "service",
         "living_street",
     )
-    CACHE_VERSION = "osm_trails_v2_robust"
+    CACHE_VERSION = "osm_trails_v3_buffer_clip"
     FALLBACK_ENDPOINTS = (
         "https://overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
-        "https://overpass.nchc.org.tw/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
     )
 
     def __init__(
@@ -75,10 +76,13 @@ class OsmTrailService:
         query_margin_m: float = 50.0,
         max_area_km2: float = 150.0,
         cache_ttl_hours: float = 24.0,
+        wait_timeout_s: float = 60.0,
     ):
         self.endpoint = str(endpoint or self.DEFAULT_ENDPOINT)
         self.endpoints = tuple(dict.fromkeys((self.endpoint,) + self.FALLBACK_ENDPOINTS))
         self.timeout_s = max(5, int(timeout_s or 25))
+        # Queue time and transfer are separate from the declared query runtime.
+        self.wait_timeout_s = max(self.timeout_s + 2.0, float(wait_timeout_s))
         self.query_margin_m = max(0.0, float(query_margin_m or 0.0))
         self.max_area_km2 = max(0.1, float(max_area_km2 or 150.0))
         self.cache_ttl_hours = max(0.0, float(cache_ttl_hours or 24.0))
@@ -104,6 +108,9 @@ class OsmTrailService:
             geom_wgs = self._transform(geom, src, wgs84)
             if geom_wgs is None or geom_wgs.isEmpty():
                 return self._failure("Impossibile trasformare la SearchGeometry", started)
+            clip_geometry = QgsGeometry(geom_wgs)
+            if clip_geometry.type() != GeometryType.Polygon:
+                return self._failure("I sentieri richiedono un’area buffer poligonale", started)
             metric = local_metric_crs(geom_wgs.centroid().asPoint())
             geom_m = self._transform(geom_wgs, wgs84, metric)
             if geom_wgs is None or geom_wgs.isEmpty() or geom_m is None or geom_m.isEmpty():
@@ -138,7 +145,9 @@ class OsmTrailService:
                 self.endpoint = endpoint_used or self.endpoint
                 self._write_cache(cache_path, payload)
 
-            layer, count, warning = self._parse_to_layer(payload)
+            # Cache the raw response, then clip again to the exact current buffer.
+            # Different buffers can share an envelope without sharing their shape.
+            layer, count, warning = self._parse_to_layer(payload, clip_geometry)
             elapsed_ms = int((time.monotonic() - started) * 1000)
             if layer is None:
                 return OsmTrailResult(
@@ -179,79 +188,37 @@ class OsmTrailService:
             "out tags geom;"
         )
 
-    def _download(self, query: str):
-        errors = []
-        endpoint_used = ""
-        body = QByteArray(("data=" + self._urlencode(query)).encode("utf-8"))
-        for endpoint in self.endpoints[:2]:
-            endpoint_used = endpoint
-            try:
-                request = QNetworkRequest(QUrl(endpoint))
-                try:
-                    request.setTransferTimeout((self.timeout_s + 2) * 1000)
-                except Exception:
-                    pass
-                request.setHeader(QNetworkRequest.ContentTypeHeader, "application/x-www-form-urlencoded; charset=UTF-8")
-                blocking = QgsBlockingNetworkRequest()
-                result = blocking.post(request, body, forceRefresh=True)
-                if result != QgsBlockingNetworkRequest.NoError:
-                    errors.append(blocking.errorMessage() or f"Errore richiesta {endpoint}")
-                    continue
-                reply = blocking.reply()
-                if reply is None:
-                    errors.append(f"Risposta assente da {endpoint}")
-                    continue
-                status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-                try:
-                    status = int(status)
-                except Exception:
-                    status = 200
-                if status >= 400:
-                    errors.append(f"HTTP {status} da {endpoint}")
-                    continue
-                raw = bytes(reply.content())
-                if not raw:
-                    errors.append(f"Risposta vuota da {endpoint}")
-                    continue
-                try:
-                    return json.loads(raw.decode("utf-8")), None, endpoint
-                except Exception as exc:
-                    errors.append(f"JSON non valido da {endpoint}: {exc}")
-            except Exception as exc:
-                errors.append(f"{endpoint}: {exc}")
-        return None, "Download Overpass fallito: " + " | ".join(errors[-2:]), endpoint_used
+    def _download(self, query):
+        return download_overpass(query, self.endpoints, self.timeout_s,
+                                 wait_timeout_s=self.wait_timeout_s)
 
-    @staticmethod
-    def _urlencode(text: str) -> str:
-        from urllib.parse import quote_plus
-        return quote_plus(text)
-
-    def _parse_to_layer(self, payload):
+    def _parse_to_layer(self, payload, clip_geometry=None):
         if not isinstance(payload, dict):
             return None, 0, "Risposta OSM non riconosciuta"
         elements = payload.get("elements") or []
-        layer = QgsVectorLayer("LineString?crs=EPSG:4326", "GeoLichen – OSM Trails", "memory")
+        layer = QgsVectorLayer("LineString?crs=EPSG:4326", "GeoLichen – Sentieri OSM nel buffer", "memory")
+        layer.setCustomProperty('geolichen/temporary_osm_trails', True)
         if not layer.isValid():
             return None, 0, "Impossibile creare il layer temporaneo OSM"
 
         fields = [
-            QgsField("osm_id", QVariant.LongLong),
-            QgsField("highway", QVariant.String),
-            QgsField("trail_class", QVariant.String),
-            QgsField("name", QVariant.String),
-            QgsField("ref", QVariant.String),
-            QgsField("surface", QVariant.String),
-            QgsField("tracktype", QVariant.String),
-            QgsField("sac_scale", QVariant.String),
-            QgsField("trail_visibility", QVariant.String),
-            QgsField("access", QVariant.String),
-            QgsField("foot", QVariant.String),
-            QgsField("bicycle", QVariant.String),
-            QgsField("horse", QVariant.String),
-            QgsField("incline", QVariant.String),
-            QgsField("bridge", QVariant.String),
-            QgsField("tunnel", QVariant.String),
-            QgsField("source", QVariant.String),
+            QgsField("osm_id", FieldType.LongLong),
+            QgsField("highway", FieldType.String),
+            QgsField("trail_class", FieldType.String),
+            QgsField("name", FieldType.String),
+            QgsField("ref", FieldType.String),
+            QgsField("surface", FieldType.String),
+            QgsField("tracktype", FieldType.String),
+            QgsField("sac_scale", FieldType.String),
+            QgsField("trail_visibility", FieldType.String),
+            QgsField("access", FieldType.String),
+            QgsField("foot", FieldType.String),
+            QgsField("bicycle", FieldType.String),
+            QgsField("horse", FieldType.String),
+            QgsField("incline", FieldType.String),
+            QgsField("bridge", FieldType.String),
+            QgsField("tunnel", FieldType.String),
+            QgsField("source", FieldType.String),
         ]
         provider = layer.dataProvider()
         provider.addAttributes(fields)
@@ -270,9 +237,15 @@ class OsmTrailService:
             points = []
             for item in coords:
                 try:
-                    points.append(QgsPointXY(float(item["lon"]), float(item["lat"])))
+                    lon, lat = float(item['lon']), float(item['lat'])
+                    if not (math.isfinite(lon) and math.isfinite(lat)
+                            and -180 <= lon <= 180 and -90 <= lat <= 90):
+                        raise ValueError('Invalid OSM coordinates')
+                    points.append(QgsPointXY(lon, lat))
                 except Exception:
-                    continue
+                    # Do not connect points across a corrupt/missing segment.
+                    points = []
+                    break
             if len(points) < 2:
                 invalid += 1
                 continue
@@ -280,9 +253,10 @@ class OsmTrailService:
             if geom is None or geom.isEmpty():
                 invalid += 1
                 continue
-            feat = QgsFeature(layer.fields())
-            feat.setGeometry(geom)
-            feat.setAttributes([
+            if clip_geometry is not None:
+                geom = geom.intersection(clip_geometry)
+            parts = self._line_parts(geom)
+            attributes = [
                 int(element.get("id") or 0),
                 highway,
                 self.classify_osm_trail(tags),
@@ -300,8 +274,12 @@ class OsmTrailService:
                 str(tags.get("bridge") or ""),
                 str(tags.get("tunnel") or ""),
                 "© OpenStreetMap contributors",
-            ])
-            features.append(feat)
+            ]
+            for part in parts:
+                feat = QgsFeature(layer.fields())
+                feat.setGeometry(part)
+                feat.setAttributes(attributes)
+                features.append(feat)
 
         if features:
             provider.addFeatures(features)
@@ -309,7 +287,69 @@ class OsmTrailService:
         warning = None
         if invalid:
             warning = f"{invalid} way OSM prive di geometria valida sono state ignorate"
+        self.style_trail_layer(layer)
         return layer, len(features), warning
+
+    @staticmethod
+    def style_trail_layer(layer):
+        """Distinguish mapped walking paths, tracks and access roads visually.
+
+        OSM tags and analytical distances are preserved. A track is not relabelled
+        as a footpath, and an access road is not presented as a hiking trail.
+        """
+        categories = []
+        present = {str(feature['highway']) for feature in layer.getFeatures()}
+        styles = (
+            ("path", "Sentiero (path)", "#8e24aa", "0.8", "dash"),
+            ("footway", "Percorso pedonale (footway)", "#8e24aa", "0.8", "dash"),
+            ("bridleway", "Percorso equestre (bridleway)", "#8e24aa", "0.8", "dash"),
+            ("steps", "Scalinata (steps)", "#8e24aa", "0.8", "dot"),
+            ("pedestrian", "Area/strada pedonale (pedestrian)", "#8e24aa", "0.8", "solid"),
+            ("track", "Pista agricola/forestale (track)", "#a66b28", "0.65", "dash"),
+            ("service", "Strada di servizio (service)", "#526474", "0.4", "solid"),
+            ("living_street", "Strada residenziale (living_street)", "#526474", "0.4", "solid"),
+        )
+        for value, label, color, width, style in styles:
+            if value not in present:
+                continue
+            symbol = QgsLineSymbol.createSimple({
+                "line_color": color, "line_width": width, "line_style": style,
+            })
+            categories.append(QgsRendererCategory(value, symbol, label))
+        layer.setRenderer(QgsCategorizedSymbolRenderer("highway", categories))
+        layer.triggerRepaint()
+
+    @staticmethod
+    def layer_summary(layer):
+        """Count clipped segments, not distinct OSM ways or verified routes."""
+        counts = {"walking": 0, "track": 0, "road": 0}
+        if layer is None or "highway" not in layer.fields().names():
+            return "OSM: classificazione dei percorsi non disponibile."
+        for feature in layer.getFeatures():
+            value = str(feature["highway"])
+            if value in ("path", "footway", "bridleway", "steps", "pedestrian"):
+                counts["walking"] += 1
+            elif value == "track":
+                counts["track"] += 1
+            elif value in ("service", "living_street"):
+                counts["road"] += 1
+        summary = (f"OSM nel buffer — percorsi pedonali/equestri: {counts['walking']}; "
+                   f"piste: {counts['track']}; strade di accesso: {counts['road']} (segmenti).")
+        if not counts["walking"]:
+            summary += " Nessun sentiero pedonale restituito da OSM nell’area."
+        return summary
+
+    @staticmethod
+    def _line_parts(geometry):
+        """Keep line segments; ignore point-only boundary contacts and empty clips."""
+        if geometry is None or geometry.isEmpty():
+            return []
+        if geometry.isMultipart():
+            return [part for child in geometry.asGeometryCollection()
+                    for part in OsmTrailService._line_parts(child)]
+        if geometry.type() == GeometryType.Line and geometry.length() > 0:
+            return [geometry]
+        return []
 
     @staticmethod
     def classify_osm_trail(tags: dict) -> str:
@@ -354,7 +394,10 @@ class OsmTrailService:
             if age_h > self.cache_ttl_hours:
                 return None
             with open(path, "r", encoding="utf-8") as handle:
-                return json.load(handle)
+                payload = json.load(handle)
+            if not isinstance(payload, dict) or not isinstance(payload.get("elements"), list) or payload.get("remark"):
+                return None
+            return payload
         except Exception:
             return None
 

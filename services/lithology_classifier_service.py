@@ -18,6 +18,8 @@ class LithologyClassifierService:
         "marne calcaree", "marna calc", "calcschist", "calcare saccaroide",
         "calcare silicifero", "calcareo-micacea", "medolo", "esino",
         "calcari dolomitici", "marmi dolomitici", "dolomia principale",
+        "limestone", "calcareous", "chalk", "marble", "marl",
+        "substrato basico", "substrati basici", "basic substrat", "base-rich substrat",
     ]
 
     SILICEOUS_TERMS = [
@@ -28,12 +30,17 @@ class LithologyClassifierService:
         "rioliti", "andesiti", "daciti", "trachiti", "latiti", "basalto",
         "basalti", "metabasalti", "gabbri", "dioriti", "filladi", "talcoscisto",
         "serpentiniti", "peridotiti", "anfiboliti",
+        "siliceous", "silicic", "granite", "quartz", "schist", "slate",
+        "sandstone", "rhyolite", "andesite", "dacite", "trachyte",
+        "basalt", "gabbro", "diorite", "phyllite", "serpentinite", "amphibolite",
+        "roccia acida", "rocce acide", "acid rock", "acidic rock", "acid substrat",
     ]
 
     MIXED_TERMS = [
         "alternanza", "complesso", "misto", "eterogene", "flysch", "successione",
         "calcari e ", "dolomie e ", "calcari dolomitici", "argille/calcari",
         "conglomerati e arenarie", "ghiaie, blocchi, limi", "manufatti",
+        "mixed", "alternating", "heterogeneous", "interbedded",
     ]
 
     def classify(self, value: str) -> str:

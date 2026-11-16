@@ -21,8 +21,8 @@ class ReuseConfirmedPointDialog(QDialog):
         ("longitude", "X"),
         ("latitude", "Y"),
         ("altitude_m", "Quota DEM"),
-        ("uncert_m", "Incertezza GBIF"),
-        ("model_r_m", "R55–S70"),
+        ("uncert_m", "Incertezza località"),
+        ("model_r_m", "Incertezza GeoLichen"),
         ("confirmed", "Confermato il"),
     )
 
@@ -35,7 +35,7 @@ class ReuseConfirmedPointDialog(QDialog):
 
         layout = QVBoxLayout(self)
         label = QLabel(
-            "Seleziona il punto da copiare nel record corrente. "
+            "Seleziona il punto da copiare. Nel passaggio successivo scegli una o più righe di destinazione. "
             "Coordinate, quota DEM e incertezze verranno riutilizzate senza rieseguire l’analisi."
         )
         label.setWordWrap(True)
@@ -51,16 +51,18 @@ class ReuseConfirmedPointDialog(QDialog):
         self.table = QTableWidget()
         self.table.setColumnCount(len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels([title for _, title in self.COLUMNS])
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.doubleClicked.connect(self.accept)
         layout.addWidget(self.table)
 
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.button(QDialogButtonBox.Ok).setText("Copia questo punto")
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setToolTip('Scegli questo punto sorgente e passa alla selezione delle righe di destinazione.')
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setToolTip('Annulla questo passaggio senza confermare i dati.')
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Copia questo punto")
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
@@ -89,7 +91,7 @@ class ReuseConfirmedPointDialog(QDialog):
             for col_idx, (key, _) in enumerate(self.COLUMNS):
                 item = QTableWidgetItem(self._display_value(row.get(key)))
                 if key in {"longitude", "latitude", "altitude_m", "uncert_m", "model_r_m"}:
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row_idx, col_idx, item)
         self.table.resizeColumnsToContents()
         if self._visible_rows:

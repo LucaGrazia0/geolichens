@@ -3,11 +3,13 @@ import re
 import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from .lithology_classifier_service import LithologyClassifierService
 
 from ._shared_geo_utils import (
     to_float as _shared_to_float,
     local_metric_crs as _shared_local_metric_crs,
 )
+from ..core.qgis_compat import FieldType, LayerType, RASTER_IDENTIFY_VALUE, RASTER_RESAMPLE_FILTER, SHADER_LINEAR
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
@@ -15,7 +17,6 @@ from qgis.core import (
     QgsFeatureRequest,
     QgsField,
     QgsGeometry,
-    QgsMapLayerType,
     QgsPointXY,
     QgsProject,
     QgsRectangle,
@@ -23,6 +24,7 @@ from qgis.core import (
     QgsSpatialIndex,
     QgsRasterLayer,
     QgsRaster,
+    QgsBilinearRasterResampler,
     QgsSingleBandPseudoColorRenderer,
     QgsColorRampShader,
     QgsRasterShader,
@@ -43,13 +45,13 @@ except Exception:
     QColor = None
     QgsGradientColorRamp = None
     QgsGradientStop = None
-from qgis.PyQt.QtCore import QVariant
 
 from .uncertainty_service import UncertaintyService
 from .soil_service import SoilService
 from .tree_service import TreeService
 from .accessibility_engine import AccessibilityEngine
 from .scoring_model import ScoringModel
+from .context_engine import ContextEngine
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,7 @@ class HabitatSuitabilityService:
         _candidate_points=None,
         _ranking_center=None,
         _adaptive_refinement=True,
+        _compute_uncertainty=True,
     ):
         if buffer_geom is None or buffer_geom.isEmpty():
             raise ValueError("Buffer assente o vuoto")
@@ -169,29 +172,15 @@ class HabitatSuitabilityService:
         else:
             center = buffer_geom.centroid().asPoint() if buffer_geom.centroid() and not buffer_geom.centroid().isEmpty() else None
 
-        self._current_context = getattr(self, "_current_context", {}) or {}
-        try:
-            self._current_context_point = context_point if context_point is not None else center
-        except Exception:
-            self._current_context_point = center
-
-        # GeoLichen 1.8.1: contesto salvato sul servizio per evitare keyword
-        # argument in _build_env_for_point e problemi di cache/reload QGIS.
-        self._current_context = getattr(self, "_current_context", {}) or {}
-        try:
-            self._current_context_point = context_point if context_point is not None else center
-        except Exception:
-            self._current_context_point = center
-
-        context = getattr(self, "_current_context", {}) or {}
-        context_point_metric = None
-        try:
-            if context_point is not None:
-                context_point_metric = context_point
-            else:
-                context_point_metric = center
-        except Exception:
-            context_point_metric = center
+        # Each run, including refinement, owns its input context. Never reuse
+        # the previous record's locality when no context was supplied.
+        context = dict(context or {})
+        context["type"] = ContextEngine().normalize_type(context.get("type")) or "locality"
+        self._current_context = context
+        self._current_context_point = context_point if context_point is not None else center
+        ecological_context = self._build_ecological_context(profile)
+        constraints_for_run = self.ecology_engine.compute_constraints(profile)
+        forest_geometry_cache = {}
 
         # v1.7.1: indice/cache sentieri preparato una sola volta.
         if trail_layers is None:
@@ -224,15 +213,20 @@ class HabitatSuitabilityService:
                 dem_layer=dem_layer,
                 dem_layers=dem_layers,
                 dem_band=dem_band,
+                _altitude_profile=profile,
+                _forest_geometry_cache=forest_geometry_cache,
             )
+            if env.pop("_excluded_by_record_altitude", False):
+                excluded_by_altitude += 1
+                continue
             env["distance_to_center_m"] = self._distance_m(center, pt) if center else None
 
-            env = self._refine_env_with_profile(env, profile)
+            env = self._refine_env_with_profile(env, profile, ecological_context=ecological_context)
             env = self._attach_record_altitude(env, profile)
-            env = self._apply_lithology_soil_ph_proxy(env, profile)
+            env = self._apply_lithology_soil_ph_proxy(env, profile, constraints=constraints_for_run)
             try:
                 expected_ph = self.soil_service.infer_ph_preference(profile)
-                if env.get("soil_ph_num") is not None:
+                if env.get("substrate_group") in ("soil", "moss") and env.get("soil_ph_num") is not None:
                     ph_cls, ph_score, ph_reason = self.soil_service.numeric_ph_compatibility(env.get("soil_ph_num"), expected_ph)
                     env["soil_ph_class"] = ph_cls or env.get("soil_ph_class")
                     env["ph_score"] = ph_score
@@ -294,8 +288,10 @@ class HabitatSuitabilityService:
             env["terrain_reason"] = terrain_decision.get("reason")
             # GeoLichen 2.9.1: la pendenza non elimina più candidati.
             # Eventuali pendenze elevate vengono gestite solo come penalità di ranking.
-            score_result = self.ecology_engine.compute_score(profile, env)
+            score_result = self.ecology_engine.compute_score(profile, env, constraints=constraints_for_run)
             env["ecological_score"] = score_result.get("ecological_score")
+            env["constraints"] = score_result.get("constraints") or {}
+            env["ecological_evidence"] = score_result.get("environmental_evidence") or {}
 
             # GeoLichen 1.8 context-aware:
             # sostituisce l'accessibility_score basato solo sui sentieri con quello
@@ -337,7 +333,7 @@ class HabitatSuitabilityService:
                 score_result["accessibility_confidence"] = acc_component
                 score_result["geography_score"] = geo_component
                 score_result.setdefault("details", []).append(
-                    "score finale = 0.50*ecologia({}) + 0.35*cartellino({}) + 0.10*accessibilità({}) + 0.05*geografia({}); penalità pendenza={}".format(
+                    "diagnostica legacy (esclusa dal GSS e dagli spareggi) = 0.50*ecologia({}) + 0.35*cartellino({}) + 0.10*accessibilità({}) + 0.05*geografia({}); penalità pendenza={}".format(
                         round(eco_component,1), round(record_component,1), round(acc_component,1), round(geo_component,1), round(slope_penalty_value,1)
                     )
                 )
@@ -402,7 +398,7 @@ class HabitatSuitabilityService:
                 env = self.scoring_model.apply_to_env(env)
                 official_score = self._to_float(env.get("final_score"))
                 if official_score is None:
-                    official_score = legacy_raw_score if legacy_raw_score is not None else 0.0
+                    raise ValueError("Score ufficiale assente o non numerico")
                 official_score = max(0.0, min(100.0, float(official_score)))
 
                 score = official_score
@@ -418,13 +414,10 @@ class HabitatSuitabilityService:
                 diag = self.scoring_model.diagnostic_text(env)
                 if diag:
                     score_result.setdefault("details", []).append(diag)
-            except Exception:
-                official_score = legacy_raw_score if legacy_raw_score is not None else 0.0
-                score = official_score
-                env["score"] = official_score
-                env["final_score"] = official_score
-                env["norm_score"] = official_score
-                env["heat_w"] = official_score
+            except Exception as exc:
+                # A failed official model cannot silently become a different
+                # ranking formula, especially during automatic confirmation.
+                raise RuntimeError("Impossibile calcolare lo score ufficiale GeoLichen") from exc
 
             constraints = score_result.get("constraints") or self.ecology_engine.compute_constraints(profile)
 
@@ -451,41 +444,9 @@ class HabitatSuitabilityService:
                 "Verificare quota/DEM o layer fasce vegetazionali."
             )
 
-        # Ordinamento: score desc; poi, se presente quota record, preferisce il punto
-        # con delta altitudinale minore. Questo evita che un punto ecologicamente
-        # simile ma molto più alto/basso prevalga solo per altri tie-break.
-        # Ranking: a pari score, se è presente quota del cartellino,
-        # privilegia il delta altitudinale minore prima dei tie-break secondari.
-        def _rank_key(r):
-            env = r.get("env") or {}
-            score = self._to_float((r.get("env") or {}).get("final_score"))
-            if score is None:
-                score = self._to_float(r.get("score")) or 0
-            raw = self._to_float(r.get("raw_score")) or score
-            alt_delta = self._to_float(r.get("alt_delta_m"))
-            has_record_altitude = self._to_float(env.get("record_altitude")) is not None
-            raw_capped = min(100.0, float(raw))
-
-            altitude_priority = 0
-            if has_record_altitude:
-                altitude_priority = -1 * (alt_delta if alt_delta is not None else 999999)
-
-            return (
-                score,
-                self._to_float(env.get("accessibility_score")) or 0,
-                self._to_float(env.get("context_score")) or 0,
-                -1 * (self._to_float(env.get("context_dist_m")) or 999999),
-                -1 * (self._to_float(env.get("trail_dist_m")) or 999999),
-                altitude_priority,
-                self._to_float(env.get("ecological_score")) or 0,
-                raw_capped,
-                self._to_float(env.get("litho_soil_ph_score")) or 0,
-                self._to_float(env.get("aspect_bonus")) or 0,
-                self._to_float(env.get("slope")) or 0,
-                -1 * (self._to_float(r.get("distance_to_center_m")) or 999999),
-            )
-
-        features_data.sort(key=_rank_key, reverse=True)
+        # Explicit tie breaks use measured distances and the stated elevation
+        # interval. Legacy scores and bonuses never choose the winning point.
+        features_data.sort(key=self._rank_key, reverse=True)
 
         # GeoLichen 14.0.3: assegna subito il ranking alla griglia globale.
         # In precedenza i rank venivano assegnati solo dopo l'eventuale
@@ -584,7 +545,7 @@ class HabitatSuitabilityService:
                             dem_band=dem_band, grid_step_m=intermediate_step, top_n=top_n, create_layer=False,
                             visualization_mode="points", context=context, context_point=context_point,
                             locality_context=locality_context, _candidate_points=refined_points_1,
-                            _ranking_center=center, _adaptive_refinement=False,
+                            _ranking_center=center, _adaptive_refinement=False, _compute_uncertainty=False,
                         )
                         refinement_info["levels"] = 1
                         refinement_info["intermediate_points_count"] = len(r1.get("features") or [])
@@ -607,7 +568,7 @@ class HabitatSuitabilityService:
                                     dem_band=dem_band, grid_step_m=final_step, top_n=top_n, create_layer=False,
                                     visualization_mode="points", context=context, context_point=context_point,
                                     locality_context=locality_context, _candidate_points=refined_points_2,
-                                    _ranking_center=center, _adaptive_refinement=False,
+                                    _ranking_center=center, _adaptive_refinement=False, _compute_uncertainty=False,
                                 )
                                 for row in (r2.get("features") or []):
                                     row["grid_level"] = "refinement_2"
@@ -690,7 +651,7 @@ class HabitatSuitabilityService:
             best_point=best.get("point") if best else None,
             grid_step_m=grid_step_m,
             locality_context=locality_context,
-        )
+        ) if _compute_uncertainty else {}
         # FASE 7.5: rende visibili nel layer di output i metadati della
         # classificazione e del corrected center, senza influenzare il ranking.
         if locality_context is not None:
@@ -717,6 +678,8 @@ class HabitatSuitabilityService:
                     uncertainty=uncertainty,
                     radius_mm=heatmap_radius_mm,
                     opacity=heatmap_opacity,
+                    grid_step_m=refinement_info['initial_step_m'],
+                    search_extent=buffer_geom,
                 )
 
             # I punti restano sempre visibili anche in modalità heatmap. Vengono
@@ -767,6 +730,23 @@ class HabitatSuitabilityService:
             "context": context,
         }
 
+
+    def _rank_key(self, row):
+        """GSS, elevation, locality, trail, center, stable candidate id."""
+        env = row.get("env") or {}
+        score = self._to_float(env.get("final_score"))
+        if score is None:
+            score = self._to_float(row.get("score")) or 0.0
+
+        def nearest(value):
+            parsed = self._to_float(value)
+            return -parsed if parsed is not None else -math.inf
+
+        has_altitude = self._to_float(env.get("record_altitude")) is not None
+        altitude = nearest(row.get("alt_delta_m")) if has_altitude else 0.0
+        return (score, altitude, nearest(env.get("context_dist_m")),
+                nearest(env.get("trail_dist_m")), nearest(row.get("distance_to_center_m")),
+                nearest(row.get("id")))
 
     def _record_score_from_env_v282(self, env, profile):
         """Score del cartellino senza alterare la pipeline altitudinale 2.6."""
@@ -860,6 +840,7 @@ class HabitatSuitabilityService:
                 "min_altitude": lo,
                 "max_altitude": hi,
                 "tolerance_m": tol,
+                "delta_m": max(lo - float(alt), float(alt) - hi, 0.0),
             }
 
         rec_alt = self._parse_altitude_value(env.get("record_altitude"))
@@ -1047,14 +1028,7 @@ class HabitatSuitabilityService:
             elif slope > 55:
                 penalty = -2.0
 
-        # Se il punto è molto vicino a un sentiero/strada, riduci la penalità.
-        # Un raccoglitore può campionare su pendii ripidi se sono accessibili.
-        try:
-            trail_d = env.get("trail_dist_m")
-            if trail_d is not None and float(trail_d) <= 30 and penalty < 0:
-                penalty = penalty / 2.0
-        except Exception:
-            pass
+        # Trail proximity belongs to Accessibility, not terrain morphology.
 
         if penalty == 0:
             reason = f"pendenza {slope:.1f}°: nessuna penalità ({context})"
@@ -1224,6 +1198,8 @@ class HabitatSuitabilityService:
         dem_layer=None,
         dem_layers=None,
         dem_band=1,
+        _altitude_profile=None,
+        _forest_geometry_cache=None,
     ):
         env = {
             "altitude": None,
@@ -1239,7 +1215,7 @@ class HabitatSuitabilityService:
             "soil_ph_num": None,
             "soil_ph_field": "",
             "soil_ph_class": "",
-            "ph_score": 0.0,
+            "ph_score": None,
             "ph_reason": "",
             "slope": None,
             "aspect": None,
@@ -1272,12 +1248,59 @@ class HabitatSuitabilityService:
             "context_weight": None,
             "trail_accessibility_score": None,
             "litho_soil_ph": None,
-            "litho_soil_ph_score": 0.0,
+            "litho_soil_ph_score": None,
             "litho_soil_ph_match": "",
             "soil_confidence": "",
-            "soil_confidence_score": 0.0,
+            "soil_confidence_score": None,
             "soil_confidence_reason": "",
         }
+
+        candidate_dems = []
+        for layer in (dem_layers or []):
+            if self._is_raster_layer(layer) and layer not in candidate_dems:
+                candidate_dems.append(layer)
+        if self._is_raster_layer(dem_layer) and dem_layer not in candidate_dems:
+            candidate_dems.insert(0, dem_layer)
+
+        valid_samples = []
+        selected_dem = None
+        selected_altitude = None
+        selected_priority = None
+        for index, layer in enumerate(candidate_dems):
+            try:
+                value = float(self._sample_raster_value(layer, pt_wgs84, band=dem_band))
+                if math.isfinite(value):
+                    valid_samples.append((layer, value, index + 1))
+                    if selected_dem is None:
+                        selected_dem = layer
+                        selected_altitude = value
+                        selected_priority = index + 1
+            except Exception:
+                continue
+
+        env["dem_valid_count"] = len(valid_samples)
+        if selected_dem is not None:
+            env["altitude"] = selected_altitude
+            env["dem_source"] = selected_dem.name()
+            env["dem_priority"] = selected_priority
+            env["dem_selection_rule"] = "spatial_extent"
+            env["dem_fallback_used"] = bool(selected_priority and selected_priority > 1)
+            values = [v for _, v, _ in valid_samples]
+            env["dem_spread_m"] = (max(values) - min(values)) if len(values) > 1 else 0.0
+
+        if _altitude_profile is not None:
+            env = self._attach_record_altitude(env, _altitude_profile)
+            decision = self._altitude_prefilter_decision(env, _altitude_profile)
+            env["altitude_tolerance_m"] = decision.get("tolerance_m")
+            if self._strict_record_altitude_decision_v283(env).get("exclude"):
+                env["_excluded_by_record_altitude"] = True
+                return env
+        if selected_dem is not None:
+            neighbours = self._dem_neighbour_values(selected_dem, pt_wgs84, band=dem_band)
+            env["slope"] = self._slope_from_neighbours(neighbours)
+            env["aspect"] = self._aspect_from_neighbours(neighbours)
+            env["aspect_class"] = self._aspect_to_class(env.get("aspect"))
+            env["exposure"] = self._aspect_to_exposure(env.get("aspect"))
 
         if geology_layer and geology_field:
             val = self._value_at_point(geology_layer, geology_field, pt_wgs84)
@@ -1286,8 +1309,10 @@ class HabitatSuitabilityService:
 
         if soil_layer and soil_field:
             soil_feat = self._feature_at_point(soil_layer, pt_wgs84)
-            val = self._value_at_point(soil_layer, soil_field, pt_wgs84)
+            val = soil_feat[soil_field] if soil_feat is not None and soil_field in soil_feat.fields().names() else None
             env["soil_raw"] = str(val) if val not in [None, ""] else ""
+            if not self.soil_service.normalize_soil_ph(val):
+                env["substrate"] = self._normalize_substrate(val)
 
             # GeoLichen 3.1: pH numerico generico da qualunque campo del layer suolo.
             try:
@@ -1296,12 +1321,13 @@ class HabitatSuitabilityService:
                 ph_num, ph_field, ph_raw = None, "", ""
 
             if ph_num is not None:
+                if env.get("substrate") not in ("roccia", "suolo", "muschio"):
+                    env["substrate"] = None
                 env["soil_ph_num"] = ph_num
                 env["soil_ph_field"] = ph_field
                 env["soil_ph_raw"] = ph_raw
                 env["soil_ph"] = self.soil_service.ph_class_from_numeric(ph_num)
                 env["soil_ph_class"] = env.get("soil_ph")
-                env["substrate"] = "suolo"
             else:
                 # Se il campo suolo contiene valori come "acida", "basica", "neutra",
                 # questi sono pH/proprietà chimiche, non substrati.
@@ -1310,13 +1336,13 @@ class HabitatSuitabilityService:
                     env["soil_ph"] = soil_ph
                     env["soil_ph_class"] = soil_ph
                     env["soil_ph_raw"] = str(val)
-                    env["substrate"] = "suolo"
                 else:
                     env["substrate"] = self._normalize_substrate(val)
 
         if trees_layer and trees_field:
             val = self._value_at_point(trees_layer, trees_field, pt_wgs84)
             if val:
+                env["tree_observation_source"] = "forest_polygon"
                 env["tree_type"] = str(val)
                 env["tree_raw"] = str(val)
                 try:
@@ -1337,7 +1363,7 @@ class HabitatSuitabilityService:
 
         try:
             if trees_layer:
-                env["forest_dist_m"] = self._distance_to_nearest_feature_m(trees_layer, pt_wgs84)
+                env["forest_dist_m"] = self._distance_to_nearest_feature_m(trees_layer, pt_wgs84, _geometry_cache=_forest_geometry_cache)
                 env["forest_dist_score"] = 0.0  # calcolato dopo, quando il profilo è disponibile
         except Exception:
             pass
@@ -1399,43 +1425,6 @@ class HabitatSuitabilityService:
             env["accessibility_rule"] = acc.get("rule")
         except Exception:
             pass
-
-        candidate_dems = []
-        for layer in (dem_layers or []):
-            if self._is_raster_layer(layer) and layer not in candidate_dems:
-                candidate_dems.append(layer)
-        if self._is_raster_layer(dem_layer) and dem_layer not in candidate_dems:
-            candidate_dems.insert(0, dem_layer)
-
-        valid_samples = []
-        selected_dem = None
-        selected_altitude = None
-        selected_priority = None
-        for index, layer in enumerate(candidate_dems):
-            try:
-                value = float(self._sample_raster_value(layer, pt_wgs84, band=dem_band))
-                if math.isfinite(value):
-                    valid_samples.append((layer, value, index + 1))
-                    if selected_dem is None:
-                        selected_dem = layer
-                        selected_altitude = value
-                        selected_priority = index + 1
-            except Exception:
-                continue
-
-        env["dem_valid_count"] = len(valid_samples)
-        if selected_dem is not None:
-            env["altitude"] = selected_altitude
-            env["dem_source"] = selected_dem.name()
-            env["dem_priority"] = selected_priority
-            env["dem_selection_rule"] = "spatial_extent"
-            env["dem_fallback_used"] = bool(selected_priority and selected_priority > 1)
-            env["slope"] = self._estimate_slope_from_dem(selected_dem, pt_wgs84, band=dem_band)
-            env["aspect"] = self._estimate_aspect_from_dem(selected_dem, pt_wgs84, band=dem_band)
-            env["aspect_class"] = self._aspect_to_class(env.get("aspect"))
-            env["exposure"] = self._aspect_to_exposure(env.get("aspect"))
-            values = [v for _, v, _ in valid_samples]
-            env["dem_spread_m"] = (max(values) - min(values)) if len(values) > 1 else 0.0
 
         return env
 
@@ -1893,7 +1882,7 @@ class HabitatSuitabilityService:
             record_notes=habitat_evidence.get("notes"),
         )
 
-    def _refine_env_with_profile(self, env, profile):
+    def _refine_env_with_profile(self, env, profile, ecological_context=None):
         """Propaga il contesto risolto senza riclassificare il reperto.
 
         Le osservazioni GIS del punto restano nei campi ``substrate``,
@@ -1902,7 +1891,7 @@ class HabitatSuitabilityService:
         """
         env = env or {}
         profile = profile or {}
-        context = self._build_ecological_context(profile)
+        context = ecological_context or self._build_ecological_context(profile)
         context_dict = context.to_dict()
 
         env["ecological_context"] = context_dict
@@ -1913,6 +1902,8 @@ class HabitatSuitabilityService:
         env["substrate_confidence"] = context.substrate_confidence
         env["substrate_resolution_reason"] = context.substrate_resolution_reason
         env["layer_decision"] = context.layer_decision or {}
+        env["expected_ph"] = ((context.soil_traits or {}).get("soil_ph_preference")
+                              or self.soil_service.infer_ph_preference(profile))
         env["primary_pipeline"] = context.primary_pipeline
         env["environmental_pipeline"] = context.primary_pipeline
         env["record_substrate"] = context.record_substrate
@@ -1920,7 +1911,7 @@ class HabitatSuitabilityService:
         env["record_habitat_raw"] = context.record_habitat
         env["record_notes"] = context.record_notes
         env["habitat_evidence"] = context.habitat_evidence
-        env["italic_profile_used"] = bool(context.italic_profile)
+        env["italic_profile_used"] = any(bool(value) for value in (context.italic_profile or {}).values())
         env["italic_role"] = (
             "fallback" if context.substrate_source == "italic_profile"
             else "ecological_support"
@@ -1942,7 +1933,7 @@ class HabitatSuitabilityService:
 
 
 
-    def _distance_to_nearest_feature_m(self, layer, pt_wgs84, max_distance_m=1500.0):
+    def _distance_to_nearest_feature_m(self, layer, pt_wgs84, max_distance_m=1500.0, _geometry_cache=None):
         """Distanza in metri dal punto alla feature più vicina del layer."""
         if layer is None or pt_wgs84 is None:
             return None
@@ -1975,8 +1966,15 @@ class HabitatSuitabilityService:
                     geom = feat.geometry()
                     if geom is None or geom.isEmpty():
                         continue
-                    g = QgsGeometry(geom)
-                    g.transform(to_metric)
+                    # The cache belongs to this synchronous analysis only.
+                    # Keep the exact provider query and per-zone projection.
+                    cache_key = (layer.id(), metric_crs.authid(), feat.id())
+                    g = _geometry_cache.get(cache_key) if _geometry_cache is not None else None
+                    if g is None:
+                        g = QgsGeometry(geom)
+                        g.transform(to_metric)
+                        if _geometry_cache is not None:
+                            _geometry_cache[cache_key] = g
                     d = float(g.distance(point_metric))
                     if best is None or d < best:
                         best = d
@@ -2082,7 +2080,7 @@ class HabitatSuitabilityService:
 
 
 
-    def _apply_lithology_soil_ph_proxy(self, env, profile):
+    def _apply_lithology_soil_ph_proxy(self, env, profile, constraints=None):
         """Valuta coerenza pH suolo/litologia solo per terricoli-muscicoli.
 
         Non viene applicata ai saxicoli e non cambia il substrato.
@@ -2091,7 +2089,7 @@ class HabitatSuitabilityService:
         profile = profile or {}
 
         try:
-            constraints = self.ecology_engine.compute_constraints(profile)
+            constraints = self.ecology_engine.compute_constraints(profile) if constraints is None else constraints
         except Exception:
             constraints = {}
 
@@ -2109,7 +2107,6 @@ class HabitatSuitabilityService:
                 env["soil_ph"] = soil_ph
                 if soil_ph:
                     env["soil_ph_raw"] = env.get("soil_raw")
-                    env["substrate"] = "suolo"
             except Exception:
                 soil_ph = None
 
@@ -2732,7 +2729,13 @@ class HabitatSuitabilityService:
             pt_layer = self._transform_geometry(pt_geom, wgs84, layer.crs())
             if pt_layer is None or pt_layer.isEmpty():
                 return None
-            req = QgsFeatureRequest().setFilterRect(pt_layer.boundingBox())
+            bbox = pt_layer.boundingBox()
+            dx, dy = max(bbox.width(), 0.000001), max(bbox.height(), 0.000001)
+            bbox.setXMinimum(bbox.xMinimum() - dx)
+            bbox.setXMaximum(bbox.xMaximum() + dx)
+            bbox.setYMinimum(bbox.yMinimum() - dy)
+            bbox.setYMaximum(bbox.yMaximum() + dy)
+            req = QgsFeatureRequest().setFilterRect(bbox)
             for feat in layer.getFeatures(req):
                 try:
                     geom = feat.geometry()
@@ -2748,38 +2751,14 @@ class HabitatSuitabilityService:
 
 
     def _value_at_point(self, layer, field_name, pt_wgs84):
-        """Legge il valore al punto usando un filtro spaziale veloce."""
+        """Read the selected field from the same containing GIS feature."""
         try:
-            if layer is None or field_name not in [f.name() for f in layer.fields()]:
+            if layer is None or field_name not in layer.fields().names():
                 return None
-
-            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-            pt_geom = QgsGeometry.fromPointXY(pt_wgs84)
-            pt_layer = self._transform_geometry(pt_geom, wgs84, layer.crs())
-            if pt_layer is None or pt_layer.isEmpty():
-                return None
-
-            bbox = pt_layer.boundingBox()
-            try:
-                dx = max(bbox.width(), 0.000001)
-                dy = max(bbox.height(), 0.000001)
-                bbox.setXMinimum(bbox.xMinimum() - dx)
-                bbox.setXMaximum(bbox.xMaximum() + dx)
-                bbox.setYMinimum(bbox.yMinimum() - dy)
-                bbox.setYMaximum(bbox.yMaximum() + dy)
-            except Exception:
-                pass
-
-            request = QgsFeatureRequest().setFilterRect(bbox)
-            for feat in layer.getFeatures(request):
-                g = feat.geometry()
-                if g is None or g.isEmpty():
-                    continue
-                if g.contains(pt_layer) or g.intersects(pt_layer):
-                    return feat[field_name]
+            feature = self._feature_at_point(layer, pt_wgs84)
+            return feature[field_name] if feature is not None else None
         except Exception:
             return None
-        return None
 
 
     # ------------------------------------------------------------------
@@ -2789,7 +2768,7 @@ class HabitatSuitabilityService:
         if layer is None:
             return False
         try:
-            return layer.type() == QgsMapLayerType.RasterLayer and layer.isValid()
+            return layer.type() == LayerType.Raster and layer.isValid()
         except Exception:
             return False
 
@@ -2812,7 +2791,7 @@ class HabitatSuitabilityService:
 
             value = None
             try:
-                identified = provider.identify(sample_point, QgsRaster.IdentifyFormatValue)
+                identified = provider.identify(sample_point, RASTER_IDENTIFY_VALUE)
                 if identified is not None and identified.isValid():
                     value = (identified.results() or {}).get(int(band))
             except Exception:
@@ -2849,44 +2828,30 @@ class HabitatSuitabilityService:
             return None
 
     def _estimate_slope_from_dem(self, raster_layer, pt_wgs84, band=1):
-        try:
-            vals = self._dem_neighbour_values(raster_layer, pt_wgs84, band=band)
-            if vals is None:
-                return None
-            z_left, z_right, z_down, z_up, step = vals
-
-            dzdx = (z_right - z_left) / (2.0 * step)
-            dzdy = (z_up - z_down) / (2.0 * step)
-
-            import math
-            slope_rad = math.atan((dzdx * dzdx + dzdy * dzdy) ** 0.5)
-            return float(math.degrees(slope_rad))
-        except Exception:
-            return None
+        return self._slope_from_neighbours(self._dem_neighbour_values(raster_layer, pt_wgs84, band))
 
     def _estimate_aspect_from_dem(self, raster_layer, pt_wgs84, band=1):
-        """
-        Stima aspect in gradi 0-360.
-        0/360 = nord, 90 = est, 180 = sud, 270 = ovest.
-        """
-        try:
-            vals = self._dem_neighbour_values(raster_layer, pt_wgs84, band=band)
-            if vals is None:
-                return None
-            z_left, z_right, z_down, z_up, step = vals
+        return self._aspect_from_neighbours(self._dem_neighbour_values(raster_layer, pt_wgs84, band))
 
-            dzdx = (z_right - z_left) / (2.0 * step)
-            dzdy = (z_up - z_down) / (2.0 * step)
-
-            import math
-
-            # Aspect classico: direzione di massima discesa.
-            aspect_rad = math.atan2(dzdx, dzdy)
-            aspect_deg = 180.0 + math.degrees(aspect_rad)
-            aspect_deg = aspect_deg % 360.0
-            return float(aspect_deg)
-        except Exception:
+    @staticmethod
+    def _slope_from_neighbours(values):
+        if values is None:
             return None
+        left, right, down, up, step = values
+        dx, dy = (right - left) / (2.0 * step), (up - down) / (2.0 * step)
+        return float(math.degrees(math.atan(math.sqrt(dx * dx + dy * dy))))
+
+    @staticmethod
+    def _aspect_from_neighbours(values):
+        if values is None:
+            return None
+        left, right, down, up, step = values
+        dx, dy = (right - left) / (2.0 * step), (up - down) / (2.0 * step)
+        # Only numerical zero is suppressed: no invented DEM accuracy is
+        # assumed. A quality-dependent near-flat threshold needs DEM metadata.
+        if math.hypot(dx, dy) <= 1e-12:
+            return None
+        return float((180.0 + math.degrees(math.atan2(dx, dy))) % 360.0)
 
     def _dem_neighbour_values(self, raster_layer, pt_wgs84, band=1):
         try:
@@ -2999,7 +2964,8 @@ class HabitatSuitabilityService:
             "porfido", "porfidi", "rioliti", "riolite",
             "arenaria", "arenarie", "sandstone",
             "siltite", "siltiti", "argillite", "argilliti",
-            "conglomerato", "conglomerati"
+            "conglomerato", "conglomerati",
+            "granite", "quartz", "schist", "slate", "rhyolite"
         ]
 
         # Carbonatico/basico.
@@ -3007,7 +2973,8 @@ class HabitatSuitabilityService:
             "calcare", "calcari", "calcareo", "calcarea",
             "dolomia", "dolomie", "dolomit", "dolomitico", "dolomitica",
             "carbonat", "marmo", "marmi",
-            "marna", "marne"
+            "marna", "marne",
+            "limestone", "calcareous", "chalk", "marble", "marl"
         ]
 
         has_siliceous = any(k in text for k in siliceous_terms)
@@ -3022,6 +2989,9 @@ class HabitatSuitabilityService:
             return "calcareo"
         if any(k in text for k in ["misto", "alternanza", "complesso", "flysch"]):
             return "misto"
+        bilingual = LithologyClassifierService().classify(value)
+        if bilingual in {'calcareo', 'siliceo', 'misto'}:
+            return bilingual
         return str(value).strip().lower()
 
 
@@ -3040,7 +3010,16 @@ class HabitatSuitabilityService:
             return "muschio"
         return str(value).strip().lower()
 
-    def _create_heatmap_layer(self, features_data, layer_name="GeoLichen Suitability Surface", uncertainty=None, radius_mm=18, opacity=0.60):
+    @staticmethod
+    def configure_heatmap_display(raster):
+        """Resample rendered colors at display scale; never modify source values."""
+        raster.pipe().setResamplingStage(RASTER_RESAMPLE_FILTER)
+        resampling = raster.resampleFilter()
+        resampling.setZoomedInResampler(QgsBilinearRasterResampler())
+        resampling.setZoomedOutResampler(QgsBilinearRasterResampler())
+        resampling.setMaxOversampling(2.0)
+
+    def _create_heatmap_layer(self, features_data, layer_name="GeoLichen Suitability Surface", uncertainty=None, radius_mm=18, opacity=0.60, grid_step_m=None, search_extent=None):
         """GeoLichen Suitability Surface (GSS) v4.2.
 
         Non è una heatmap di densità.
@@ -3057,7 +3036,7 @@ class HabitatSuitabilityService:
             import tempfile
             import math
             import numpy as np
-            from osgeo import gdal
+            from osgeo import gdal, ogr, osr
             from qgis.core import (
                 QgsRasterLayer,
     QgsRaster,
@@ -3135,13 +3114,13 @@ class HabitatSuitabilityService:
             # Raster più fine della griglia: con passo 30 m usa normalmente
             # pixel da 7.5 m. Il maggiore dettaglio riguarda solo la resa della
             # superficie e non crea nuova informazione ecologica.
-            inferred_spacing = (
+            inferred_spacing = float(grid_step_m) if grid_step_m is not None else (
                 float(np.median(inferred))
                 if inferred
                 else max(10.0, min(span_x, span_y) / 160.0)
             )
             cell = inferred_spacing / 4.0
-            cell = max(3.0, min(15.0, cell))
+            cell = max(3.0, min(25.0, cell))
 
             # Limite prudente per aree estese; la dimensione viene adattata senza
             # alterare i punti o il ranking.
@@ -3156,11 +3135,19 @@ class HabitatSuitabilityService:
             # originale e fonde le impronte dei punti adiacenti, eliminando il tipico
             # effetto "a pallini" dell'IDW centrato sui candidati.
             bandwidth = max(inferred_spacing * 1.10, cell * 4.0)
-            support_radius = min(240.0, max(bandwidth * 3.0, inferred_spacing * 2.5))
-            xmin -= support_radius
-            xmax += support_radius
-            ymin -= support_radius
-            ymax += support_radius
+            support_radius = max(bandwidth * 3.0, inferred_spacing * 2.5)
+            search_metric = None
+            if search_extent is not None and not search_extent.isEmpty():
+                search_metric = self._transform_geometry(search_extent, wgs84, metric)
+                bounds = search_metric.boundingBox()
+                xmin, xmax = bounds.xMinimum(), bounds.xMaximum()
+                ymin, ymax = bounds.yMinimum(), bounds.yMaximum()
+            else:
+                xmin -= support_radius
+                xmax += support_radius
+                ymin -= support_radius
+                ymax += support_radius
+            cell = max(cell, (xmax - xmin) / max_dim, (ymax - ymin) / max_dim)
 
             width = int(math.ceil((xmax - xmin) / cell))
             height = int(math.ceil((ymax - ymin) / cell))
@@ -3176,28 +3163,47 @@ class HabitatSuitabilityService:
             grid_x = xmin + (np.arange(width, dtype=float) + 0.5) * cell
             two_sigma2 = 2.0 * bandwidth * bandwidth
 
+            # Restrict each tile to neighbouring samples instead of allocating
+            # a full image-width x all-candidates matrix for every raster row.
+            by_y = np.argsort(ys)
+            sorted_y = ys[by_y]
             for r in range(height):
                 y = ymax - (r + 0.5) * cell
-                gx = grid_x[:, None]
-                dy = y - ys[None, :]
-                dx = gx - xs[None, :]
-                d2 = dx * dx + dy * dy
+                lo = np.searchsorted(sorted_y, y - support_radius, side='left')
+                hi = np.searchsorted(sorted_y, y + support_radius, side='right')
+                band_indices = by_y[lo:hi]
+                for start in range(0, width, 128):
+                    end = min(start + 128, width)
+                    tile_x = grid_x[start:end]
+                    indices = band_indices[(xs[band_indices] >= tile_x[0] - support_radius)
+                                           & (xs[band_indices] <= tile_x[-1] + support_radius)]
+                    if not indices.size:
+                        continue
+                    d2 = ((tile_x[:, None] - xs[indices][None, :]) ** 2
+                          + (y - ys[indices][None, :]) ** 2)
+                    kernel = np.exp(-d2 / max(two_sigma2, 1e-9))
+                    kernel[d2 > support_radius ** 2] = 0.0
+                    weights = kernel * score_weight[indices][None, :]
+                    sum_w = weights.sum(axis=1)
+                    values = (weights * zs[indices][None, :]).sum(axis=1) / np.maximum(sum_w, 1e-9)
+                    valid = sum_w > 1e-8
+                    tile = arr[r, start:end]
+                    tile[valid] = np.clip(values[valid], 0.0, 100.0).astype(np.float32)
 
-                nearest_d = np.sqrt(d2.min(axis=1))
-                mask = nearest_d <= support_radius
-                if not np.any(mask):
-                    continue
-
-                # Tutti i punti entro tre sigma contribuiscono. Non viene imposto
-                # il valore esatto del candidato nel centro della cella: questo evita
-                # anelli e macchie circolari isolate.
-                kernel = np.exp(-d2 / max(two_sigma2, 1e-9))
-                kernel[d2 > support_radius * support_radius] = 0.0
-                w = kernel * score_weight[None, :]
-                sum_w = w.sum(axis=1)
-                vals = (w * zs[None, :]).sum(axis=1) / np.maximum(sum_w, 1e-9)
-                valid_row = mask & (sum_w > 1e-8)
-                arr[r, valid_row] = np.clip(vals[valid_row], 0.0, 100.0).astype(np.float32)
+            if search_metric is not None:
+                mask_ds = gdal.GetDriverByName('MEM').Create('', width, height, 1, gdal.GDT_Byte)
+                mask_ds.SetGeoTransform((xmin, cell, 0.0, ymax, 0.0, -cell))
+                mask_ds.SetProjection(metric.toWkt())
+                driver = ogr.GetDriverByName('MEM') or ogr.GetDriverByName('Memory')
+                vector = driver.CreateDataSource('')
+                reference = osr.SpatialReference()
+                reference.ImportFromWkt(metric.toWkt())
+                mask_layer = vector.CreateLayer('search_area', srs=reference, geom_type=ogr.wkbUnknown)
+                mask_feature = ogr.Feature(mask_layer.GetLayerDefn())
+                mask_feature.SetGeometry(ogr.CreateGeometryFromWkb(bytes(search_metric.asWkb())))
+                mask_layer.CreateFeature(mask_feature)
+                gdal.RasterizeLayer(mask_ds, [1], mask_layer, burn_values=[1])
+                arr[mask_ds.ReadAsArray() == 0] = -9999.0
 
             # Curva di contrasto robusta.
             valid_mask = arr != -9999.0
@@ -3235,11 +3241,14 @@ class HabitatSuitabilityService:
             raster = QgsRasterLayer(str(out_path), layer_name)
             if not raster.isValid():
                 raise ValueError("raster GSS non valido")
+            raster.setCustomProperty('geolichen/base_grid_step_m', inferred_spacing)
+            raster.setCustomProperty('geolichen/support_radius_m', support_radius)
+            raster.setCustomProperty('geolichen/search_area_clipped', search_metric is not None)
 
             try:
                 shader = QgsRasterShader()
                 ramp = QgsColorRampShader()
-                ramp.setColorRampType(QgsColorRampShader.Interpolated)
+                ramp.setColorRampType(SHADER_LINEAR)
                 if QColor is not None:
                     items = [
                         QgsColorRampShader.ColorRampItem(0, QColor(220, 242, 255, 135), "molto bassa"),
@@ -3268,6 +3277,7 @@ class HabitatSuitabilityService:
                 pass
 
             QgsProject.instance().addMapLayer(raster)
+            self.configure_heatmap_display(raster)
             return raster
 
         except Exception:
@@ -3474,7 +3484,7 @@ class HabitatSuitabilityService:
                 return
             shader = QgsRasterShader()
             color_ramp = QgsColorRampShader()
-            color_ramp.setColorRampType(QgsColorRampShader.Interpolated)
+            color_ramp.setColorRampType(SHADER_LINEAR)
             items = [
                 QgsColorRampShader.ColorRampItem(0, QColor(60, 100, 220), "0"),
                 QgsColorRampShader.ColorRampItem(40, QColor(50, 200, 180), "40"),
@@ -3516,187 +3526,192 @@ class HabitatSuitabilityService:
 
     def _create_points_layer(self, features_data, layer_name="Habitat suitability points", uncertainty=None, add_to_project=True):
         layer = QgsVectorLayer("Point?crs=EPSG:4326", layer_name, "memory")
+        layer.setCustomProperty('geolichen/output', True)
         provider = layer.dataProvider()
         provider.addAttributes([
-            QgsField("rank", QVariant.Int),
-            QgsField("grid_lvl", QVariant.String),
-            QgsField("top10", QVariant.String),
-            QgsField("selected", QVariant.String),
-            QgsField("sel_method", QVariant.String),
-            QgsField("sel_reason", QVariant.String),
-            QgsField("score", QVariant.Int),
-            QgsField("raw_score", QVariant.Double),
-            QgsField("heat_w", QVariant.Double),
-            QgsField("eco_score", QVariant.Double),
-            QgsField("acc_score", QVariant.Double),
-            QgsField("record_score", QVariant.Double),
-            QgsField("access_conf", QVariant.Double),
-            QgsField("geo_score", QVariant.Double),
-            QgsField("final_score", QVariant.Double),
-            QgsField("terrain_s", QVariant.Double),
-            QgsField("terrain_r", QVariant.String),
-            QgsField("slope_pen", QVariant.Double),
-            QgsField("slope_ctx", QVariant.String),
-            QgsField("slope_r", QVariant.String),
-            QgsField("ctx_type", QVariant.String),
-            QgsField("ctx_dist_m", QVariant.Double),
-            QgsField("ctx_score", QVariant.Double),
-            QgsField("trail_acc", QVariant.Double),
-            QgsField("trail_src", QVariant.String),
-            QgsField("trail_name", QVariant.String),
-            QgsField("trail_type", QVariant.String),
-            QgsField("trail_cls", QVariant.String),
-            QgsField("vt_access", QVariant.String),
-            QgsField("rock_type", QVariant.String),
-            QgsField("rock_raw", QVariant.String),
-            QgsField("litho_ph", QVariant.String),
-            QgsField("litho_ph_s", QVariant.Double),
-            QgsField("litho_ph_m", QVariant.String),
-            QgsField("substrate", QVariant.String),
-            QgsField("soil_raw", QVariant.String),
-            QgsField("soil_ph", QVariant.String),
-            QgsField("soil_ph_raw", QVariant.String),
-            QgsField("soil_conf", QVariant.String),
-            QgsField("soil_conf_s", QVariant.Double),
-            QgsField("soil_reason", QVariant.String),
-            QgsField("soil_ph_num", QVariant.Double),
-            QgsField("soil_ph_f", QVariant.String),
-            QgsField("soil_ph_cls", QVariant.String),
-            QgsField("ph_score", QVariant.Double),
-            QgsField("ph_reason", QVariant.String),
-            QgsField("tree_type", QVariant.String),
-            QgsField("tree_raw", QVariant.String),
-            QgsField("expected_tree", QVariant.String),
-            QgsField("observed_tree", QVariant.String),
-            QgsField("forest_cat", QVariant.String),
-            QgsField("forest_lit", QVariant.String),
-            QgsField("forest_dist_m", QVariant.Double),
-            QgsField("forest_dist_s", QVariant.Double),
-            QgsField("tree_score", QVariant.Double),
-            QgsField("tree_reason", QVariant.String),
-            QgsField("trail_dist_m", QVariant.Double),
-            QgsField("trail_bonus", QVariant.Double),
-            QgsField("trail_pen", QVariant.Double),
-            QgsField("veget_belt", QVariant.String),
-            QgsField("belt_match", QVariant.String),
-            QgsField("belt_min", QVariant.Double),
-            QgsField("belt_max", QVariant.Double),
-            QgsField("humidity", QVariant.String),
-            QgsField("altitude", QVariant.Double),
-            QgsField("dem_source", QVariant.String),
-            QgsField("dem_priority", QVariant.Int),
-            QgsField("dem_valid_n", QVariant.Int),
-            QgsField("dem_fallback", QVariant.String),
-            QgsField("dem_spread_m", QVariant.Double),
-            QgsField("record_altitude", QVariant.Double),
-            QgsField("alt_delta_m", QVariant.Double),
-            QgsField("alt_min_ok", QVariant.Double),
-            QgsField("alt_max_ok", QVariant.Double),
-            QgsField("alt_filter", QVariant.String),
-            QgsField("alt_tol_m", QVariant.Double),
-            QgsField("italic_alt_min", QVariant.Double),
-            QgsField("italic_alt_max", QVariant.Double),
-            QgsField("it_alt_cls", QVariant.String),
-            QgsField("it_alt_src", QVariant.String),
-            QgsField("slope", QVariant.Double),
-            QgsField("aspect", QVariant.Double),
-            QgsField("aspect_cls", QVariant.String),
-            QgsField("record_asp", QVariant.String),
-            QgsField("asp_diff", QVariant.Double),
-            QgsField("asp_bonus", QVariant.Double),
-            QgsField("asp_match", QVariant.String),
-            QgsField("exposure", QVariant.String),
-            QgsField("dist_m", QVariant.Double),
-            QgsField("constraints", QVariant.String),
-            QgsField("constraint_sources", QVariant.String),
-            QgsField("gbif_constraints", QVariant.String),
-            QgsField("gss_constraints", QVariant.String),
-            QgsField("details", QVariant.String),
-            QgsField("uncert_m", QVariant.Double),
-            QgsField("gbif_unc_m", QVariant.Double),
-            QgsField("model_r_m", QVariant.Double),
-            QgsField("geo_rad_m", QVariant.Double),
-            QgsField("grid_err_m", QVariant.Double),
-            QgsField("confidence", QVariant.String),
-            QgsField("mci", QVariant.Double),
-            QgsField("mci_class", QVariant.String),
-            QgsField("mci_reason", QVariant.String),
-            QgsField("cand_spread", QVariant.Double),
-            QgsField("data_comp", QVariant.Double),
-            QgsField("eco_unique", QVariant.Double),
-            QgsField("equiv_cand", QVariant.Int),
-            QgsField("score_gap", QVariant.Double),
-            QgsField("ssi", QVariant.Double),
-            QgsField("ssi_class", QVariant.String),
-            QgsField("ssi_reason", QVariant.String),
-            QgsField("loo_dist_m", QVariant.Double),
-            QgsField("ssi_spread", QVariant.Double),
-            QgsField("ssi_alt_n", QVariant.Int),
-            QgsField("ssi_cl_n", QVariant.Int),
-            QgsField("ssi_main_n", QVariant.Int),
-            QgsField("ssi_share", QVariant.Double),
-            QgsField("ssi_rad_m", QVariant.Double),
-            QgsField("ssi_med_m", QVariant.Double),
-            QgsField("ssi_eps_m", QVariant.Double),
-            QgsField("ssi_near_m", QVariant.Double),
-            QgsField("gbif_lon", QVariant.Double),
-            QgsField("gbif_lat", QVariant.Double),
-            QgsField("gbif_ctr_m", QVariant.String),
-            QgsField("gbif_ctr_s", QVariant.String),
-            QgsField("decimalLatitude", QVariant.Double),
-            QgsField("decimalLongitude", QVariant.Double),
-            QgsField("geodeticDatum", QVariant.String),
-            QgsField("coordinateUncertaintyInMeters", QVariant.Double),
-            QgsField("coordinatePrecision", QVariant.Double),
-            QgsField("pointRadiusSpatialFit", QVariant.Double),
-            QgsField("footprintWKT", QVariant.String),
-            QgsField("footprintSRS", QVariant.String),
-            QgsField("georeferencedBy", QVariant.String),
-            QgsField("georeferencedDate", QVariant.String),
-            QgsField("georeferenceProtocol", QVariant.String),
-            QgsField("georeferenceSources", QVariant.String),
-            QgsField("georeferenceVerificationStatus", QVariant.String),
-            QgsField("georeferenceRemarks", QVariant.String),
-            QgsField("gbif_dwc_complete", QVariant.String),
-            QgsField("loc_type", QVariant.String),
-            QgsField("geom_type", QVariant.String),
-            QgsField("loc_cls_cf", QVariant.Double),
-            QgsField("loc_cls_r", QVariant.String),
-            QgsField("loc_ref_t", QVariant.String),
-            QgsField("loc_ref_n", QVariant.String),
-            QgsField("plaus_alt", QVariant.String),
-            QgsField("alt_reason", QVariant.String),
-            QgsField("score_dlt", QVariant.Double),
-            QgsField("aspect_sc", QVariant.Double),
-            QgsField("aspect_r", QVariant.String),
-            QgsField("aspect_deg", QVariant.Double),
-            QgsField("aspect_dir", QVariant.String),
-            QgsField("record_aspect", QVariant.String),
-            QgsField("aspect_diff_deg", QVariant.Double),
-            QgsField("aspect_score", QVariant.Double),
-            QgsField("eco_exposure", QVariant.String),
-            QgsField("norm_score", QVariant.Double),
-            QgsField("norm_w", QVariant.String),
-            QgsField("score_comp", QVariant.String),
-            QgsField("alt_score", QVariant.Double),
-            QgsField("sub_score", QVariant.Double),
-            QgsField("lith_score", QVariant.Double),
-            QgsField("italic_score", QVariant.Double),
-            QgsField("access_score", QVariant.Double),
-            QgsField("slope_score", QVariant.Double),
-            QgsField("geo_macro", QVariant.Double),
-            QgsField("terrain_m", QVariant.Double),
-            QgsField("env_macro", QVariant.Double),
-            QgsField("access_m", QVariant.Double),
-            QgsField("score_arch", QVariant.String),
-            QgsField("env_group", QVariant.String),
-            QgsField("env_sub_s", QVariant.Double),
-            QgsField("env_lith_s", QVariant.Double),
-            QgsField("env_ph_s", QVariant.Double),
-            QgsField("env_hab_s", QVariant.Double),
-            QgsField("env_tree_s", QVariant.Double),
-            QgsField("env_parts", QVariant.String),
-            QgsField("env_w", QVariant.String),
+            QgsField("rank", FieldType.Int),
+            QgsField("grid_lvl", FieldType.String),
+            QgsField("top10", FieldType.String),
+            QgsField("selected", FieldType.String),
+            QgsField("sel_method", FieldType.String),
+            QgsField("sel_reason", FieldType.String),
+            QgsField("score", FieldType.Int),
+            QgsField("raw_score", FieldType.Double),
+            QgsField("heat_w", FieldType.Double),
+            QgsField("eco_score", FieldType.Double),
+            QgsField("acc_score", FieldType.Double),
+            QgsField("record_score", FieldType.Double),
+            QgsField("access_conf", FieldType.Double),
+            QgsField("geo_score", FieldType.Double),
+            QgsField("final_score", FieldType.Double),
+            QgsField("terrain_s", FieldType.Double),
+            QgsField("terrain_r", FieldType.String),
+            QgsField("slope_pen", FieldType.Double),
+            QgsField("slope_ctx", FieldType.String),
+            QgsField("slope_r", FieldType.String),
+            QgsField("ctx_type", FieldType.String),
+            QgsField("ctx_dist_m", FieldType.Double),
+            QgsField("ctx_score", FieldType.Double),
+            QgsField("trail_acc", FieldType.Double),
+            QgsField("trail_src", FieldType.String),
+            QgsField("trail_name", FieldType.String),
+            QgsField("trail_type", FieldType.String),
+            QgsField("trail_cls", FieldType.String),
+            QgsField("vt_access", FieldType.String),
+            QgsField("rock_type", FieldType.String),
+            QgsField("rock_raw", FieldType.String),
+            QgsField("litho_ph", FieldType.String),
+            QgsField("litho_ph_s", FieldType.Double),
+            QgsField("litho_ph_m", FieldType.String),
+            QgsField("substrate", FieldType.String),
+            QgsField("soil_raw", FieldType.String),
+            QgsField("soil_ph", FieldType.String),
+            QgsField("soil_ph_raw", FieldType.String),
+            QgsField("soil_conf", FieldType.String),
+            QgsField("soil_conf_s", FieldType.Double),
+            QgsField("soil_reason", FieldType.String),
+            QgsField("soil_ph_num", FieldType.Double),
+            QgsField("soil_ph_f", FieldType.String),
+            QgsField("soil_ph_cls", FieldType.String),
+            QgsField("ph_score", FieldType.Double),
+            QgsField("ph_reason", FieldType.String),
+            QgsField("tree_type", FieldType.String),
+            QgsField("tree_raw", FieldType.String),
+            QgsField("expected_tree", FieldType.String),
+            QgsField("observed_tree", FieldType.String),
+            QgsField("forest_cat", FieldType.String),
+            QgsField("forest_lit", FieldType.String),
+            QgsField("forest_dist_m", FieldType.Double),
+            QgsField("forest_dist_s", FieldType.Double),
+            QgsField("tree_score", FieldType.Double),
+            QgsField("tree_reason", FieldType.String),
+            QgsField("trail_dist_m", FieldType.Double),
+            QgsField("trail_bonus", FieldType.Double),
+            QgsField("trail_pen", FieldType.Double),
+            QgsField("veget_belt", FieldType.String),
+            QgsField("belt_match", FieldType.String),
+            QgsField("belt_min", FieldType.Double),
+            QgsField("belt_max", FieldType.Double),
+            QgsField("humidity", FieldType.String),
+            QgsField("altitude", FieldType.Double),
+            QgsField("dem_source", FieldType.String),
+            QgsField("dem_priority", FieldType.Int),
+            QgsField("dem_valid_n", FieldType.Int),
+            QgsField("dem_fallback", FieldType.String),
+            QgsField("dem_spread_m", FieldType.Double),
+            QgsField("record_altitude", FieldType.Double),
+            QgsField("alt_delta_m", FieldType.Double),
+            QgsField("alt_min_ok", FieldType.Double),
+            QgsField("alt_max_ok", FieldType.Double),
+            QgsField("alt_filter", FieldType.String),
+            QgsField("alt_tol_m", FieldType.Double),
+            QgsField("italic_alt_min", FieldType.Double),
+            QgsField("italic_alt_max", FieldType.Double),
+            QgsField("it_alt_cls", FieldType.String),
+            QgsField("it_alt_src", FieldType.String),
+            QgsField("slope", FieldType.Double),
+            QgsField("aspect", FieldType.Double),
+            QgsField("aspect_cls", FieldType.String),
+            QgsField("record_asp", FieldType.String),
+            QgsField("asp_diff", FieldType.Double),
+            QgsField("asp_bonus", FieldType.Double),
+            QgsField("asp_match", FieldType.String),
+            QgsField("exposure", FieldType.String),
+            QgsField("dist_m", FieldType.Double),
+            QgsField("constraints", FieldType.String),
+            QgsField("constraint_sources", FieldType.String),
+            QgsField("gbif_constraints", FieldType.String),
+            QgsField("gss_constraints", FieldType.String),
+            QgsField("details", FieldType.String),
+            QgsField("uncert_m", FieldType.Double),
+            QgsField("gbif_unc_m", FieldType.Double),
+            QgsField("model_r_m", FieldType.Double),
+            QgsField("geo_rad_m", FieldType.Double),
+            QgsField("grid_err_m", FieldType.Double),
+            QgsField("confidence", FieldType.String),
+            QgsField("mci", FieldType.Double),
+            QgsField("mci_class", FieldType.String),
+            QgsField("mci_reason", FieldType.String),
+            QgsField("cand_spread", FieldType.Double),
+            QgsField("data_comp", FieldType.Double),
+            QgsField("eco_unique", FieldType.Double),
+            QgsField("equiv_cand", FieldType.Int),
+            QgsField("score_gap", FieldType.Double),
+            QgsField("ssi", FieldType.Double),
+            QgsField("ssi_class", FieldType.String),
+            QgsField("ssi_reason", FieldType.String),
+            QgsField("loo_dist_m", FieldType.Double),
+            QgsField("ssi_spread", FieldType.Double),
+            QgsField("ssi_alt_n", FieldType.Int),
+            QgsField("ssi_cl_n", FieldType.Int),
+            QgsField("ssi_main_n", FieldType.Int),
+            QgsField("ssi_share", FieldType.Double),
+            QgsField("ssi_rad_m", FieldType.Double),
+            QgsField("ssi_med_m", FieldType.Double),
+            QgsField("ssi_eps_m", FieldType.Double),
+            QgsField("ssi_near_m", FieldType.Double),
+            QgsField("gbif_lon", FieldType.Double),
+            QgsField("gbif_lat", FieldType.Double),
+            QgsField("gbif_ctr_m", FieldType.String),
+            QgsField("gbif_ctr_s", FieldType.String),
+            QgsField("decimalLatitude", FieldType.Double),
+            QgsField("decimalLongitude", FieldType.Double),
+            QgsField("geodeticDatum", FieldType.String),
+            QgsField("coordinateUncertaintyInMeters", FieldType.Double),
+            QgsField("coordinatePrecision", FieldType.Double),
+            QgsField("pointRadiusSpatialFit", FieldType.Double),
+            QgsField("footprintWKT", FieldType.String),
+            QgsField("footprintSRS", FieldType.String),
+            QgsField("georeferencedBy", FieldType.String),
+            QgsField("georeferencedDate", FieldType.String),
+            QgsField("georeferenceProtocol", FieldType.String),
+            QgsField("georeferenceSources", FieldType.String),
+            QgsField("georeferenceVerificationStatus", FieldType.String),
+            QgsField("georeferenceRemarks", FieldType.String),
+            QgsField("gbif_dwc_complete", FieldType.String),
+            QgsField("loc_type", FieldType.String),
+            QgsField("geom_type", FieldType.String),
+            QgsField("loc_cls_cf", FieldType.Double),
+            QgsField("loc_cls_r", FieldType.String),
+            QgsField("loc_ref_t", FieldType.String),
+            QgsField("loc_ref_n", FieldType.String),
+            QgsField("plaus_alt", FieldType.String),
+            QgsField("alt_reason", FieldType.String),
+            QgsField("score_dlt", FieldType.Double),
+            QgsField("aspect_sc", FieldType.Double),
+            QgsField("aspect_r", FieldType.String),
+            QgsField("aspect_deg", FieldType.Double),
+            QgsField("aspect_dir", FieldType.String),
+            QgsField("record_aspect", FieldType.String),
+            QgsField("aspect_diff_deg", FieldType.Double),
+            QgsField("aspect_score", FieldType.Double),
+            QgsField("eco_exposure", FieldType.String),
+            QgsField("norm_score", FieldType.Double),
+            QgsField("norm_w", FieldType.String),
+            QgsField("score_comp", FieldType.String),
+            QgsField("alt_score", FieldType.Double),
+            QgsField("sub_score", FieldType.Double),
+            QgsField("lith_score", FieldType.Double),
+            QgsField("italic_score", FieldType.Double),
+            QgsField("access_score", FieldType.Double),
+            QgsField("slope_score", FieldType.Double),
+            QgsField("geo_macro", FieldType.Double),
+            QgsField("terrain_m", FieldType.Double),
+            QgsField("env_macro", FieldType.Double),
+            QgsField("access_m", FieldType.Double),
+            QgsField("score_arch", FieldType.String),
+            QgsField("env_group", FieldType.String),
+            QgsField("env_sub_s", FieldType.Double),
+            QgsField("env_lith_s", FieldType.Double),
+            QgsField("env_ph_s", FieldType.Double),
+            QgsField("env_hab_s", FieldType.Double),
+            QgsField("env_tree_s", FieldType.Double),
+            QgsField("env_parts", FieldType.String),
+            QgsField("env_w", FieldType.String),
+            QgsField("env_cov", FieldType.Double),
+            QgsField("env_qcov", FieldType.Double),
+            QgsField("env_neut", FieldType.Double),
+            QgsField("env_status", FieldType.String),
         ])
         layer.updateFields()
 
@@ -3911,6 +3926,10 @@ class HabitatSuitabilityService:
             feat["env_tree_s"] = self._to_float(env.get("environmental_tree_score"))
             feat["env_parts"] = str(env.get("environmental_components") or "")[:220]
             feat["env_w"] = str(env.get("environmental_weights") or "")[:220]
+            feat["env_cov"] = self._to_float(env.get("environmental_available_weight"))
+            feat["env_qcov"] = self._to_float(env.get("environmental_quality_coverage"))
+            feat["env_neut"] = self._to_float(env.get("environmental_neutral_contribution"))
+            feat["env_status"] = str(env.get("environmental_status") or "")
             feats.append(feat)
 
         provider.addFeatures(feats)

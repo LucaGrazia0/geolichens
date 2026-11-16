@@ -6,6 +6,7 @@ It is deliberately conservative: when the source geometry or the relation is
 ambiguous, it returns the original extent and records that manual verification
 is required rather than inventing a smaller uncertainty.
 """
+from ..core.enum_utils import enum_value
 
 import math
 
@@ -93,7 +94,7 @@ class GbifLocalityGeometryService:
 
         elif kind == "along_path":
             distance = max(0.0, self._float(spec.get("distance_m"), 0.0))
-            if metric_geom.type() != 1:  # QgsWkbTypes.LineGeometry
+            if enum_value(metric_geom.type()) != 1:
                 return self._result(
                     geom, "along_path_requires_line", False, True,
                     "L'offset lungo percorso richiede la geometria lineare del percorso.", spec,

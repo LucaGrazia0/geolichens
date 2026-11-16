@@ -3,6 +3,7 @@
 Kept deliberately small: resolvers consume geometries already supplied by the
 boundary pipeline and only decode provider GeoJSON when necessary.
 """
+from ..enum_utils import enum_value
 import json
 
 try:
@@ -19,7 +20,7 @@ def geometry_type_name(geometry):
     try:
         if geometry.isEmpty():
             return "EMPTY"
-        return {0: "POINT", 1: "LINE", 2: "POLYGON"}.get(int(geometry.type()), "UNKNOWN")
+        return {0: "POINT", 1: "LINE", 2: "POLYGON"}.get(enum_value(geometry.type()), "UNKNOWN")
     except Exception:
         return "UNKNOWN"
 

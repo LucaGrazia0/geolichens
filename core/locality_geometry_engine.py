@@ -5,6 +5,7 @@ This first block resolves already available source geometries into explicit
 performs no DEM reconstruction and does not replace the legacy pipeline yet.
 """
 from __future__ import annotations
+from .enum_utils import enum_value
 
 from typing import Any, Callable, Mapping, Optional
 
@@ -47,7 +48,7 @@ class LocalityGeometryEngine:
             return fallback.upper()
         try:
             # QGIS geometry type: 0 point, 1 line, 2 polygon.
-            geom_type = int(geometry.type())
+            geom_type = enum_value(geometry.type())
             return {0: "POINT", 1: "LINE", 2: "POLYGON"}.get(geom_type, fallback.upper())
         except Exception:
             return fallback.upper()

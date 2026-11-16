@@ -1,6 +1,11 @@
-from qgis.PyQt.QtCore import Qt
+from pathlib import Path
+
+from qgis.PyQt.QtCore import QSize, Qt, QSettings
+from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt import sip
 from ..services.search_area_service import SearchAreaService
+from ..models.geocoding_config import DEFAULT_PHOTON_ENDPOINT
+from .collapsible_section import CollapsibleSection
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -12,6 +17,7 @@ from qgis.PyQt.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QTextEdit,
     QListWidget,
     QListWidgetItem,
@@ -22,6 +28,50 @@ from qgis.PyQt.QtWidgets import (
 
 
 class MainDock(QDockWidget):
+    def capture_session_state(self):
+        """Retain controls in process memory only, including the configured Photon endpoint."""
+        state = {}
+        for name, widget in vars(self).items():
+            if isinstance(widget, QLineEdit) and name != 'txtSuitabilityGridStep':
+                state[name] = ('text', widget.text())
+            elif isinstance(widget, QComboBox):
+                if name in ('cmbRecordLayer', 'cmbMunicipalityBoundaryLayer'):
+                    state[name] = ('source', widget.currentData())
+                else:
+                    state[name] = ('combo', widget.currentText())
+            elif isinstance(widget, QCheckBox):
+                state[name] = ('checked', widget.isChecked())
+            elif isinstance(widget, QListWidget):
+                state[name] = ('items', [(widget.item(i).text(), widget.item(i).checkState())
+                                         for i in range(widget.count())])
+        return state
+
+    def restore_session_state(self, state):
+        for name, (kind, value) in state.items():
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            if kind == 'text':
+                widget.setText(value)
+            elif kind in ('combo', 'source'):
+                if name == 'cmbSuitabilityView' and value == 'Heatmap':
+                    value = 'Suitability Surface'
+                index = widget.findData(value) if kind == 'source' else widget.findText(value)
+                if index >= 0:
+                    widget.setCurrentIndex(index)
+            elif kind == 'checked':
+                widget.setChecked(value)
+            elif kind == 'items':
+                remaining = [widget.takeItem(0) for _ in range(widget.count())]
+                for text, checked in value:
+                    item = next((item for item in remaining if item.text() == text), None)
+                    if item is not None:
+                        remaining.remove(item)
+                        item.setCheckState(checked)
+                        widget.addItem(item)
+                for item in remaining:
+                    widget.addItem(item)
+
     def __init__(self, iface, parent=None):
         super().__init__('GeoLichen', parent or iface.mainWindow())
         self.iface = iface
@@ -35,20 +85,29 @@ class MainDock(QDockWidget):
         # ------------------------------------------------------------
         # CONFIGURAZIONE
         # ------------------------------------------------------------
-        gb_config = QGroupBox('Configurazione')
-        config_form = QFormLayout(gb_config)
-        config_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        self.configurationSection = CollapsibleSection('Configurazione layer e campi tabella record', full_width=True)
+        gb_config = self.configurationSection
+        config_form = QFormLayout()
+        gb_config.content_layout.addLayout(config_form)
+        config_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
-        self.txtApiKey = QLineEdit()
-        self.txtApiKey.setPlaceholderText('API key MapTiler')
+        self.txtGeocoderUrl = QLineEdit(str(QSettings().value(
+            'geolichen/photon_endpoint', DEFAULT_PHOTON_ENDPOINT)))
+        self.txtGeocoderUrl.setPlaceholderText(DEFAULT_PHOTON_ENDPOINT)
+        self.txtGeocoderUrl.setToolTip('URL dell’API Photon basata su OpenStreetMap. Nessuna chiave MapTiler richiesta.')
+        self.lblGeocoderSource = QLabel('Località: Photon / OpenStreetMap · © OpenStreetMap contributors')
+        self.lblGeocoderSource.setWordWrap(True)
+        self.lblGeocoderSource.setToolTip('Servizio pubblico dimostrativo per uso moderato; per uso intensivo configura una tua istanza Photon.')
 
         self.cmbSearchArea = QComboBox()
         self.cmbSearchArea.addItems(SearchAreaService.names())
         self.cmbSearchArea.setCurrentText(SearchAreaService.DEFAULT_AREA)
 
         self.chkLimitSearchArea = QCheckBox('Limita la ricerca all’area selezionata')
+        self.chkLimitSearchArea.setToolTip('Limita le località cercate all’area geografica scelta.')
         self.chkLimitSearchArea.setChecked(True)
-        self.chkAutoExpandSearchArea = QCheckBox('Espandi automaticamente se nessun risultato plausibile')
+        self.chkAutoExpandSearchArea = QCheckBox('Espandi automaticamente se nessun\nrisultato plausibile')
+        self.chkAutoExpandSearchArea.setToolTip('Allarga la ricerca se non trova località plausibili nell’area scelta.')
         self.chkAutoExpandSearchArea.setChecked(True)
 
         self.txtBbox = QLineEdit(
@@ -60,36 +119,90 @@ class MainDock(QDockWidget):
         self.txtBbox.setEnabled(False)
 
         self.btnConfigureFields = QPushButton('⚙  Configura campi input')
+        self.btnConfigureFields.setToolTip('Associa le colonne della tabella a località, specie e altri dati del record.')
 
-        config_form.addRow('API key', self.txtApiKey)
+        config_form.addRow(self.lblGeocoderSource)
+        config_form.addRow('Servizio Photon', self.txtGeocoderUrl)
         config_form.addRow('Area di ricerca', self.cmbSearchArea)
         config_form.addRow(self.chkLimitSearchArea)
         config_form.addRow(self.chkAutoExpandSearchArea)
         config_form.addRow('BBox personalizzata', self.txtBbox)
+        self.cmbMunicipalityBoundaryLayer = QComboBox()
+        self.cmbMunicipalityBoundaryLayer.addItem('Nessun layer dei confini comunali', '')
+        self.cmbMunicipalityBoundaryField = QComboBox()
+        self.cmbMunicipalityBoundaryLayer.setToolTip('Layer poligonale dei confini comunali caricato nel progetto; facoltativo.')
+        self.cmbMunicipalityBoundaryField.setToolTip('Colonna con il nome del comune. Serve a verificare i candidati, mantenendo il buffer circolare.')
+        self.chkUseLocalityArchive = QCheckBox('Usa l’archivio delle località\nconfermate e salva le nuove scelte')
+        self.chkUseLocalityArchive.setChecked(QSettings().value('geolichen/use_locality_archive', True, type=bool))
+        self.chkUseLocalityArchive.setToolTip('Conserva nel profilo QGIS i punti geografici che confermi, disponibili anche dopo la chiusura e senza rete.')
+        self.btnLocalityArchive = QPushButton('Archivio località confermate…')
+        self.btnLocalityArchive.setToolTip('Consulta o rimuovi le località memorizzate; ogni record conserva la propria analisi ecologica.')
+        config_form.addRow('Confini comunali (facoltativo)', self.cmbMunicipalityBoundaryLayer)
+        config_form.addRow('Campo nome comune', self.cmbMunicipalityBoundaryField)
+        config_form.addRow(self.chkUseLocalityArchive)
+        config_form.addRow(self.btnLocalityArchive)
         config_form.addRow(self.btnConfigureFields)
         outer_layout.addWidget(gb_config)
 
         # ------------------------------------------------------------
         # GEOREFERENZIAZIONE - controller operativo principale
         # ------------------------------------------------------------
-        gb_geo = QGroupBox('Georeferenziazione')
+        gb_geo = QGroupBox('Georeferenziazione Località')
+        gb_geo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.georeferencingGroup = gb_geo
         geo_layout = QVBoxLayout(gb_geo)
         geo_layout.setSpacing(8)
 
-        self.btnAnalyze = QPushButton('Analizza record selezionato')
-        self.btnAnalyze.setMinimumHeight(32)
-        geo_layout.addWidget(self.btnAnalyze)
+        source_form = QFormLayout()
+        self.cmbRecordLayer = QComboBox()
+        self.cmbRecordLayer.setToolTip('Tabella da cui leggere la riga selezionata e in cui salvare i risultati.')
+        source_form.addRow('Tabella record', self.cmbRecordLayer)
+        geo_layout.addLayout(source_form)
+
+        self.btnAnalyze = QPushButton('Ricerca della località')
+        self.btnAnalyze.setToolTip('Cerca la località della riga selezionata e definisce l’area di ricerca.')
+        self.btnAnalyze.setFixedHeight(52)
+        self.btnAnalyze.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.btnUseLocalityCentroid = QPushButton()
+        self.btnUseLocalityCentroid.setIcon(QIcon(str(Path(__file__).parent / 'icons' / 'locality_centroid.png')))
+        self.btnUseLocalityCentroid.setIconSize(QSize(40, 40))
+        self.btnUseLocalityCentroid.setFixedHeight(52)
+        self.btnUseLocalityCentroid.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.btnUseLocalityCentroid.setAccessibleName('Sono a posto così — centroide della località')
+        self.btnUseLocalityCentroid.setToolTip(
+            'Sono a posto così: concludi con il centroide del buffer e la quota DEM, senza ranking ecologico')
+        self.localityActionsLayout = QHBoxLayout()
+        self.localityActionsLayout.setSpacing(8)
+        self.localityActionsLayout.addWidget(self.btnAnalyze, 4)
+        self.localityActionsLayout.addWidget(self.btnUseLocalityCentroid, 1)
+        geo_layout.addLayout(self.localityActionsLayout)
+
+        self.lblBufferGridInfo = QLabel('Buffer: nessuna area definita • Passo griglia: —')
+        self.lblBufferGridInfo.setWordWrap(True)
+        self.lblBufferGridInfo.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lblBufferGridInfo.setToolTip(
+            'Superficie dell’area di ricerca corrente e passo base della griglia. '
+            'Il raffinamento locale può usare passi più piccoli. Per le aree automatiche '
+            'il raggio di riferimento è metà del lato maggiore del rettangolo che le contiene.'
+        )
+        geo_layout.addWidget(self.lblBufferGridInfo)
 
         # Strumenti mantenuti per compatibilità con il controller, ma non
         # più mostrati nell'interfaccia principale.
         self.btnItalic = QPushButton('Leggi profilo ITALIC')
+        self.btnItalic.setToolTip('Scarica il profilo ecologico ITALIC della specie del record corrente.')
         self.btnItalic.setVisible(False)
         self.btnRedefineBuffer = QPushButton('Ridefinisci buffer')
+        self.btnRedefineBuffer.setToolTip('Avvia la ridefinizione del buffer dalla mappa.')
         self.btnRedefineBuffer.setVisible(False)
         self.txtHeatmapRadius = QLineEdit('18')
         self.txtHeatmapRadius.setVisible(False)
         self.txtHeatmapOpacity = QLineEdit('60')
         self.txtHeatmapOpacity.setVisible(False)
+
+        self.manualGeometrySection = CollapsibleSection('Punto e linea manuali')
+        manual_layout = self.manualGeometrySection.content_layout
+        geo_layout.addWidget(self.manualGeometrySection)
 
         # Punto manuale
         point_box = QGroupBox('Punto manuale')
@@ -97,9 +210,10 @@ class MainDock(QDockWidget):
         self.txtManualBuffer = QLineEdit('250')
         self.txtManualBuffer.setPlaceholderText('Raggio in metri')
         self.btnManualPoint = QPushButton('Punto manuale + buffer')
+        self.btnManualPoint.setToolTip('Scegli un centro sulla mappa e crea un buffer con il raggio indicato.')
         point_form.addRow('Buffer (m)', self.txtManualBuffer)
         point_form.addRow(self.btnManualPoint)
-        geo_layout.addWidget(point_box)
+        manual_layout.addWidget(point_box)
 
         # Linea manuale
         line_box = QGroupBox('Linea manuale')
@@ -107,41 +221,80 @@ class MainDock(QDockWidget):
         self.txtManualLineOffset = QLineEdit('500')
         self.txtManualLineOffset.setPlaceholderText('Offset laterale in metri')
         self.btnManualLine = QPushButton('Linea manuale + offset')
+        self.btnManualLine.setToolTip('Disegna una linea sulla mappa e crea un’area di ricerca con l’offset indicato.')
         line_form.addRow('Offset (m)', self.txtManualLineOffset)
         line_form.addRow(self.btnManualLine)
-        geo_layout.addWidget(line_box)
+        manual_layout.addWidget(line_box)
 
         model_form = QFormLayout()
-        self.txtSuitabilityGridStep = QLineEdit('30')
+        self.txtSuitabilityGridStep = QLineEdit('10', gb_geo)
+        self.txtSuitabilityGridStep.setVisible(False)
         self.txtSuitabilityGridStep.setPlaceholderText('Passo griglia in metri')
         self.cmbSuitabilityView = QComboBox()
         self.cmbSuitabilityView.addItems(['Punti candidati', 'Suitability Surface', 'Entrambi'])
+        self.cmbSuitabilityView.setToolTip(
+            'Suitability Surface visualizza una heatmap dell’idoneità ecologica nell’area di ricerca.')
+        self.cmbSuitabilityView.setItemData(
+            1, 'Visualizza una heatmap dell’idoneità ecologica nell’area di ricerca.', Qt.ItemDataRole.ToolTipRole)
         self.cmbSuitabilityView.setCurrentText('Punti candidati')
-        model_form.addRow('Passo griglia (m)', self.txtSuitabilityGridStep)
         model_form.addRow('Visualizzazione', self.cmbSuitabilityView)
         geo_layout.addLayout(model_form)
-
-        self.btnHabitatSuitability = QPushButton('Trova punto ecologico più probabile')
-        self.btnHabitatSuitability.setMinimumHeight(32)
-        geo_layout.addWidget(self.btnHabitatSuitability)
-
-        actions = QHBoxLayout()
-        self.btnReuseConfirmedPoint = QPushButton('Copia punto')
-        self.btnConfirmPoint = QPushButton('Conferma punto ecologico')
-        actions.addWidget(self.btnReuseConfirmedPoint)
-        actions.addWidget(self.btnConfirmPoint)
-        geo_layout.addLayout(actions)
+        self.lblOsmTrailsInfo = QLabel('')
+        self.lblOsmTrailsInfo.setWordWrap(True)
+        self.lblOsmTrailsInfo.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lblOsmTrailsInfo.setVisible(False)
+        geo_layout.addWidget(self.lblOsmTrailsInfo)
 
         outer_layout.addWidget(gb_geo)
+
+        self.ecologicalAnalysisGroup = QGroupBox('Analisi ecologica')
+        self.ecologicalAnalysisGroup.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        ecological_layout = QVBoxLayout(self.ecologicalAnalysisGroup)
+        ecological_layout.setSpacing(8)
+        self.btnHabitatSuitability = QPushButton('Analisi ecologica\nstep by step')
+        self.btnHabitatSuitability.setAccessibleName('Analisi ecologica step by step')
+        self.btnHabitatSuitability.setToolTip(
+            'Calcola la griglia e scegli un candidato sulla mappa prima di confermare i dati.')
+        self.btnAutomaticPoint = QPushButton('Analisi ecologica\nautomatica')
+        self.btnAutomaticPoint.setAccessibleName('Analisi ecologica automatica')
+        self.btnAutomaticPoint.setToolTip(
+            'Ricerca la località, calcola la griglia e salva il punto di rank 1 nella riga selezionata.')
+        self.ecologicalActionsLayout = QHBoxLayout()
+        self.ecologicalActionsLayout.setSpacing(8)
+        for button in (self.btnHabitatSuitability, self.btnAutomaticPoint):
+            button.setMinimumHeight(40)
+            button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            self.ecologicalActionsLayout.addWidget(button, 1)
+        ecological_layout.addLayout(self.ecologicalActionsLayout)
+
+        self.lblCandidatePreview = QLabel('')
+        self.lblCandidatePreview.setWordWrap(True)
+        self.lblCandidatePreview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lblCandidatePreview.setToolTip(
+            'Coordinate del candidato in WGS84 (EPSG:4326). L’incertezza GeoLichen '
+            'è il raggio del modello R55–S65, distinto dall’incertezza della località.')
+        self.lblCandidatePreview.setVisible(False)
+        ecological_layout.addWidget(self.lblCandidatePreview)
+
+        self.btnReuseConfirmedPoint = QPushButton('Copia su altri record')
+        self.btnReuseConfirmedPoint.setToolTip('Scegli un punto già confermato e copiane i dati su una o più righe.')
+        self.btnReuseConfirmedPoint.setMinimumHeight(32)
+        ecological_layout.addWidget(self.btnReuseConfirmedPoint)
+        outer_layout.addWidget(self.ecologicalAnalysisGroup)
+
+        self.lblOperationalStatus = QLabel('Pronto')
+        self.lblOperationalStatus.setWordWrap(True)
+        outer_layout.addWidget(self.lblOperationalStatus)
 
         # ------------------------------------------------------------
         # LAYER AMBIENTALI - invariati
         # ------------------------------------------------------------
-        gb_layers = QGroupBox('Layer ambientali')
-        layers_form = QFormLayout(gb_layers)
+        # Keep every existing widget and controller binding, grouped by layer.
+        layers_layout = gb_config.content_layout
         self.cmbGeologyLayer = QComboBox()
         self.cmbGeologyField = QComboBox()
         self.btnCreateGroupLito = QPushButton('Crea / aggiorna GRUPPO_LITO')
+        self.btnCreateGroupLito.setToolTip('Crea o aggiorna il campo GRUPPO_LITO nel layer geologico selezionato.')
         self.lblGroupLitoInfo = QLabel('-')
         self.lblGroupLitoInfo.setWordWrap(True)
         self.cmbSoilLayer = QComboBox()
@@ -150,8 +303,10 @@ class MainDock(QDockWidget):
         self.cmbTreesField = QComboBox()
         self.cmbTrailLayer = QComboBox()
         self.chkUseOsmTrails = QCheckBox('Usa dati sentieristici OpenStreetMap')
+        self.chkUseOsmTrails.setToolTip('Scarica i sentieri e le vie di accesso OSM, ritaglia i tratti nel buffer corrente e li usa per calcolare le distanze. Non certifica la percorribilità.')
         self.chkUseOsmTrails.setChecked(True)
         self.chkShowOsmTrails = QCheckBox('Mostra layer OSM scaricato')
+        self.chkShowOsmTrails.setToolTip('Mostra sulla mappa i dati OpenStreetMap scaricati per l’area di ricerca.')
         self.chkShowOsmTrails.setChecked(True)
         self.lstAccessibilityLayers = QListWidget()
         self.lstAccessibilityLayers.setMinimumHeight(90)
@@ -163,28 +318,52 @@ class MainDock(QDockWidget):
         self.lstDemLayers = QListWidget()
         self.lstDemLayers.setMinimumHeight(90)
         self.lstDemLayers.setMaximumHeight(160)
-        self.lstDemLayers.setDragDropMode(QListWidget.InternalMove)
-        layers_form.addRow('Geologia/Litologia', self.cmbGeologyLayer)
-        layers_form.addRow('Campo geologia', self.cmbGeologyField)
-        layers_form.addRow(self.btnCreateGroupLito)
-        layers_form.addRow('Esito GRUPPO_LITO', self.lblGroupLitoInfo)
-        layers_form.addRow('Suolo', self.cmbSoilLayer)
-        layers_form.addRow('Campo suolo', self.cmbSoilField)
-        layers_form.addRow('Alberi/Boschi', self.cmbTreesLayer)
-        layers_form.addRow('Campo alberi', self.cmbTreesField)
-        layers_form.addRow('Layer accessibilità', self.lstAccessibilityLayers)
-        layers_form.addRow(self.chkUseOsmTrails)
-        layers_form.addRow(self.chkShowOsmTrails)
-        layers_form.addRow('Fasce vegetazionali', self.cmbVegetationBeltLayer)
-        layers_form.addRow('Campo fascia vegetazionale', self.cmbVegetationBeltField)
-        layers_form.addRow('Layer DEM (priorità dall’alto)', self.lstDemLayers)
-        outer_layout.addWidget(gb_layers)
+        self.lstDemLayers.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        def layer_box(title, rows, hint=None):
+            box = QGroupBox(title)
+            form = QFormLayout(box)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            for label, widget in rows:
+                if label:
+                    form.addRow(label, widget)
+                else:
+                    form.addRow(widget)
+            if hint:
+                text = QLabel(hint)
+                text.setWordWrap(True)
+                form.addRow(text)
+            layers_layout.addWidget(box)
+            return box
+
+        self.geologyBox = layer_box('Geologia / Litologia', [
+            ('Layer', self.cmbGeologyLayer), ('Campo litologico', self.cmbGeologyField),
+            ('', self.btnCreateGroupLito), ('Esito', self.lblGroupLitoInfo),
+        ], 'Riconoscimento automatico delle descrizioni italiane e inglesi durante l’analisi. '
+           'La creazione di GRUPPO_LITO è facoltativa.')
+        self.soilBox = layer_box('Suolo / Acidità', [
+            ('Layer', self.cmbSoilLayer), ('Campo pH / suolo', self.cmbSoilField),
+        ], 'Lettura automatica del pH numerico o delle classi acido, neutro e basico.')
+        self.treesBox = layer_box('Alberi / Boschi', [
+            ('Layer', self.cmbTreesLayer), ('Campo alberi', self.cmbTreesField),
+        ])
+        self.accessibilityBox = layer_box('Accessibilità', [
+            ('Layer', self.lstAccessibilityLayers), ('', self.chkUseOsmTrails),
+            ('', self.chkShowOsmTrails),
+        ])
+        self.vegetationBox = layer_box('Fasce vegetazionali', [
+            ('Layer', self.cmbVegetationBeltLayer), ('Campo fascia', self.cmbVegetationBeltField),
+        ])
+        self.demBox = layer_box('Modelli digitali del terreno (DEM)', [
+            ('Priorità dall’alto', self.lstDemLayers),
+        ])
 
         # ------------------------------------------------------------
         # PROFILO ITALIC - invariato, letto dalla pipeline
         # ------------------------------------------------------------
-        gb_italic = QGroupBox('Profilo ITALIC')
-        italic_form = QFormLayout(gb_italic)
+        self.italicSection = CollapsibleSection('Profilo ITALIC')
+        gb_italic = self.italicSection
+        italic_form = QFormLayout()
+        gb_italic.content_layout.addLayout(italic_form)
         self.lblItalicTaxon = QLabel('-')
         self.lblItalicTaxon.setWordWrap(True)
         self.lblItalicSubstrata = QLabel('-')
@@ -195,8 +374,8 @@ class MainDock(QDockWidget):
         self.lblItalicTree.setWordWrap(True)
         self.lblItalicEcology = QTextEdit()
         self.lblItalicEcology.setReadOnly(True)
-        self.lblItalicEcology.setLineWrapMode(QTextEdit.WidgetWidth)
-        self.lblItalicEcology.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.lblItalicEcology.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.lblItalicEcology.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.lblItalicEcology.setMinimumHeight(140)
         self.lblItalicEcology.setMaximumHeight(260)
         self.lblItalicUrl = QLabel('-')
@@ -233,10 +412,11 @@ class MainDock(QDockWidget):
 
         self.btnResultDetails = QToolButton()
         self.btnResultDetails.setText('Dettagli')
+        self.btnResultDetails.setToolTip('Mostra o nasconde query, località trovate e riepilogo dei candidati.')
         self.btnResultDetails.setCheckable(True)
         self.btnResultDetails.setChecked(False)
-        self.btnResultDetails.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.btnResultDetails.setArrowType(Qt.RightArrow)
+        self.btnResultDetails.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btnResultDetails.setArrowType(Qt.ArrowType.RightArrow)
         result_layout.addWidget(self.btnResultDetails)
 
         self.resultDetailsWidget = QWidget()
@@ -247,9 +427,9 @@ class MainDock(QDockWidget):
         self.lblCandidates.setWordWrap(True)
         self.txtHabitatTop10 = QTextEdit()
         self.txtHabitatTop10.setReadOnly(True)
-        self.txtHabitatTop10.setLineWrapMode(QTextEdit.NoWrap)
-        self.txtHabitatTop10.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.txtHabitatTop10.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.txtHabitatTop10.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.txtHabitatTop10.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.txtHabitatTop10.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.txtHabitatTop10.setMinimumHeight(120)
         self.txtHabitatTop10.setMaximumHeight(220)
         self.txtHabitatTop10.setPlainText('-')
@@ -261,9 +441,11 @@ class MainDock(QDockWidget):
 
         def _toggle_result_details(checked):
             self.resultDetailsWidget.setVisible(bool(checked))
-            self.btnResultDetails.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+            self.btnResultDetails.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
 
         self.btnResultDetails.toggled.connect(_toggle_result_details)
+        self.resultGroup = gb_result
+        gb_result.setVisible(False)
         outer_layout.addWidget(gb_result)
 
         # ------------------------------------------------------------
@@ -274,9 +456,31 @@ class MainDock(QDockWidget):
         self.lblMapping = QLabel('Non configurati')
         self.lblMapping.setWordWrap(True)
         input_form.addRow(self.lblMapping)
+        self.inputSummaryGroup = gb_input
+        gb_input.setVisible(False)
         outer_layout.addWidget(gb_input)
 
         outer_layout.addStretch(1)
+
+        # Layer names must not become the minimum width of the dock. The popup
+        # still exposes their complete text; forms can put fields below labels.
+        for combo in outer.findChildren(QComboBox):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(12)
+            combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            hint = combo.toolTip()
+            combo.currentTextChanged.connect(
+                lambda _text, widget=combo, help_text=hint: widget.setToolTip(
+                    '\n'.join(part for part in (help_text, widget.currentText()) if part)))
+            combo.setToolTip('\n'.join(part for part in (hint, combo.currentText()) if part))
+        for form in outer.findChildren(QFormLayout):
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        for label in outer.findChildren(QLabel):
+            if label.wordWrap():
+                policy = label.sizePolicy()
+                policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+                label.setSizePolicy(policy)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -313,6 +517,16 @@ class MainDock(QDockWidget):
 
     def set_status(self, text):
         self.lblStatus.setText(text)
+        self.lblOperationalStatus.setText(text)
+
+    def set_candidate_preview(self, text=''):
+        self.lblCandidatePreview.setText(text)
+        self.lblCandidatePreview.setVisible(bool(text))
+
+    def set_osm_trails_info(self, text):
+        self.lblOsmTrailsInfo.setText(text or '')
+        self.lblOsmTrailsInfo.setToolTip(text or '')
+        self.lblOsmTrailsInfo.setVisible(bool(text))
 
     def set_mapping_summary(self, mapping_model):
         parts = []
@@ -413,7 +627,7 @@ class MainDock(QDockWidget):
         """Popola la lista multi-layer accessibilità.
 
         layer_items può contenere stringhe o tuple (label, checked).
-        Include anche layer non vettoriali classici, per esempio Vector Tile MapTiler.
+        Mostra i layer lineari utilizzabili dal motore delle distanze.
         """
         if not hasattr(self, "lstAccessibilityLayers") or self.lstAccessibilityLayers is None or sip.isdeleted(self.lstAccessibilityLayers):
             return
@@ -421,7 +635,7 @@ class MainDock(QDockWidget):
         previous_checked = set()
         for i in range(self.lstAccessibilityLayers.count()):
             item = self.lstAccessibilityLayers.item(i)
-            if item and item.checkState() == Qt.Checked:
+            if item and item.checkState() == Qt.CheckState.Checked:
                 previous_checked.add(item.text())
 
         self.lstAccessibilityLayers.blockSignals(True)
@@ -434,8 +648,8 @@ class MainDock(QDockWidget):
                 label = str(entry)
                 default_checked = False
             item = QListWidgetItem(label)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if (label in previous_checked or default_checked) else Qt.Unchecked)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if (label in previous_checked or default_checked) else Qt.CheckState.Unchecked)
             self.lstAccessibilityLayers.addItem(item)
         self.lstAccessibilityLayers.blockSignals(False)
 
@@ -446,7 +660,7 @@ class MainDock(QDockWidget):
         checked = []
         for i in range(self.lstDemLayers.count()):
             item = self.lstDemLayers.item(i)
-            if item and item.checkState() == Qt.Checked:
+            if item and item.checkState() == Qt.CheckState.Checked:
                 checked.append(item.text())
         ordered = [n for n in checked if n in layer_names]
         ordered += [n for n in layer_names if n not in ordered]
@@ -454,8 +668,8 @@ class MainDock(QDockWidget):
         self.lstDemLayers.clear()
         for name in ordered:
             item = QListWidgetItem(name)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsDragEnabled)
-            item.setCheckState(Qt.Checked if name in checked else Qt.Unchecked)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
+            item.setCheckState(Qt.CheckState.Checked if name in checked else Qt.CheckState.Unchecked)
             self.lstDemLayers.addItem(item)
         self.lstDemLayers.blockSignals(False)
 

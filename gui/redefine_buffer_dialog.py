@@ -27,6 +27,8 @@ class RedefineBufferDialog(QDialog):
 
         self.rbMove = QRadioButton("Sposta buffer: nuovo centro, stesso raggio")
         self.rbNew = QRadioButton("Nuovo buffer: nuovo centro e nuovo raggio")
+        self.rbMove.setToolTip('Cambia il centro del buffer mantenendo il raggio attuale.')
+        self.rbNew.setToolTip('Scegli un nuovo centro e usa il raggio indicato qui sotto.')
         self.rbMove.setChecked(True)
         layout.addWidget(self.rbMove)
         layout.addWidget(self.rbNew)
@@ -43,7 +45,9 @@ class RedefineBufferDialog(QDialog):
         self.rbMove.toggled.connect(self._sync_radius_enabled)
         self._sync_radius_enabled()
 
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setToolTip('Passa alla mappa per scegliere il nuovo centro del buffer.')
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setToolTip('Annulla questo passaggio senza confermare i dati.')
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)

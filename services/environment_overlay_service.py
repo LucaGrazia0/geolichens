@@ -1,9 +1,9 @@
+from ..core.qgis_compat import LayerType
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsFeatureRequest,
     QgsGeometry,
-    QgsMapLayerType,
     QgsProject,
 )
 from .lithology_classifier_service import LithologyClassifierService
@@ -20,7 +20,8 @@ class EnvironmentOverlayService:
     """
 
     GEOLOGY_FIELD_HINTS = [
-        'GRUPPO_LITO', 'LITOLOGIA', 'DESCRIZIONE', 'DESCRIZION', 'UNITA', 'FORMAZIONE', 'NOME', 'SIGLA', 'DESCR'
+        'GRUPPO_LITO', 'LITOLOGIA', 'DESCRIZIONE', 'DESCRIZION', 'UNITA', 'FORMAZIONE', 'NOME', 'SIGLA', 'DESCR',
+        'LITHOLOGY', 'ROCK_TYPE', 'DESCRIPTION', 'FORMATION', 'GEOLOGY', 'UNIT', 'ROCK'
     ]
 
     def __init__(self):
@@ -384,7 +385,7 @@ class EnvironmentOverlayService:
         return QgsCoordinateReferenceSystem('EPSG:4326')
 
     def _layer_supports_fields(self, layer):
-        return layer is not None and layer.type() == QgsMapLayerType.VectorLayer and hasattr(layer, 'fields') and callable(layer.fields)
+        return layer is not None and layer.type() == LayerType.Vector and hasattr(layer, 'fields') and callable(layer.fields)
 
     def _norm(self, value):
         if value is None:

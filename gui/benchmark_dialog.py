@@ -51,8 +51,9 @@ class BenchmarkDialog(QDialog):
 
         file_row = QHBoxLayout()
         self.btnLoad = QPushButton('Carica dataset CSV')
+        self.btnLoad.setToolTip('Apri un CSV con coordinate di riferimento e risultati dei metodi da confrontare.')
         self.lblFile = QLabel('Nessun dataset caricato')
-        self.lblFile.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lblFile.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         file_row.addWidget(self.btnLoad)
         file_row.addWidget(self.lblFile, 1)
         layout.addLayout(file_row)
@@ -90,6 +91,7 @@ class BenchmarkDialog(QDialog):
                 'latitude': lat_combo, 'longitude': lon_combo, 'runtime_s': runtime_combo,
             })
         self.btnRun = QPushButton('Esegui benchmark')
+        self.btnRun.setToolTip('Confronta accuratezza e tempi dei metodi sui record del CSV caricato.')
         self.btnRun.setEnabled(False)
         methods_layout.addWidget(self.btnRun)
         setup_layout.addWidget(methods_group)
@@ -108,7 +110,9 @@ class BenchmarkDialog(QDialog):
         results_layout.addWidget(self.table, 1)
         export_row = QHBoxLayout()
         self.btnExportCsv = QPushButton('Esporta risultati CSV')
+        self.btnExportCsv.setToolTip('Salva i risultati del confronto in un file CSV.')
         self.btnExportHtml = QPushButton('Esporta report HTML')
+        self.btnExportHtml.setToolTip('Salva il riepilogo del confronto in una pagina HTML.')
         self.btnExportCsv.setEnabled(False)
         self.btnExportHtml.setEnabled(False)
         export_row.addWidget(self.btnExportCsv)
@@ -119,6 +123,7 @@ class BenchmarkDialog(QDialog):
 
         close_row = QHBoxLayout(); close_row.addStretch(1)
         btnClose = QPushButton('Chiudi'); close_row.addWidget(btnClose)
+        btnClose.setToolTip('Chiude la finestra del benchmark.')
         layout.addLayout(close_row)
 
         self.btnLoad.clicked.connect(self.load_csv)
@@ -243,7 +248,7 @@ class BenchmarkDialog(QDialog):
                 item = QTableWidgetItem(str(value))
                 if col in (0, 2, 3, 4, 5, 6, 7, 8, 9):
                     try:
-                        item.setData(Qt.EditRole, float(str(value).replace('%', '')))
+                        item.setData(Qt.ItemDataRole.EditRole, float(str(value).replace('%', '')))
                     except Exception:
                         pass
                 self.table.setItem(row_idx, col, item)

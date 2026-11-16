@@ -48,8 +48,9 @@ class ValidationDialog(QDialog):
 
         row = QHBoxLayout()
         self.btnLoad = QPushButton('Carica dataset CSV')
+        self.btnLoad.setToolTip('Apri un CSV con risultati GeoLichen e coordinate reali di riferimento.')
         self.lblFile = QLabel('Nessun dataset caricato')
-        self.lblFile.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lblFile.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         row.addWidget(self.btnLoad)
         row.addWidget(self.lblFile, 1)
         layout.addLayout(row)
@@ -68,6 +69,7 @@ class ValidationDialog(QDialog):
             form.addRow(label + (' *' if required else ''), combo)
         mapping_layout.addWidget(group)
         self.btnRun = QPushButton('Esegui validazione')
+        self.btnRun.setToolTip('Confronta i risultati con le coordinate note e calcola le statistiche di errore.')
         self.btnRun.setEnabled(False)
         mapping_layout.addWidget(self.btnRun)
         mapping_layout.addStretch(1)
@@ -85,7 +87,9 @@ class ValidationDialog(QDialog):
         results_layout.addWidget(self.table, 1)
         export_row = QHBoxLayout()
         self.btnExportCsv = QPushButton('Esporta risultati CSV')
+        self.btnExportCsv.setToolTip('Salva gli errori calcolati per ciascun record in un file CSV.')
         self.btnExportHtml = QPushButton('Esporta report HTML')
+        self.btnExportHtml.setToolTip('Salva il riepilogo della validazione in una pagina HTML.')
         self.btnExportCsv.setEnabled(False)
         self.btnExportHtml.setEnabled(False)
         export_row.addWidget(self.btnExportCsv)
@@ -97,6 +101,7 @@ class ValidationDialog(QDialog):
         close_row = QHBoxLayout()
         close_row.addStretch(1)
         btnClose = QPushButton('Chiudi')
+        btnClose.setToolTip('Chiude la finestra di validazione.')
         close_row.addWidget(btnClose)
         layout.addLayout(close_row)
 
@@ -195,7 +200,7 @@ class ValidationDialog(QDialog):
                 item = QTableWidgetItem(str(value))
                 if c in (1, 2, 3, 5, 6, 7) and value != '—':
                     try:
-                        item.setData(Qt.EditRole, float(value))
+                        item.setData(Qt.ItemDataRole.EditRole, float(value))
                     except Exception:
                         pass
                 self.table.setItem(r, c, item)

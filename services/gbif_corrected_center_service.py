@@ -1,3 +1,4 @@
+from ..core.enum_utils import enum_value
 import math
 import random
 
@@ -55,7 +56,7 @@ class GbifCorrectedCenterService:
         extent_is_point = False
         if geom is not None:
             try:
-                extent_is_point = int(geom.type()) == 0
+                extent_is_point = enum_value(geom.type()) == 0
             except Exception:
                 extent_is_point = False
         if geometry_type == "point" and extent_is_point and geocoded_center is not None:

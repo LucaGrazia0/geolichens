@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: source-checks
+        name: Validate clean GeoLichen source
+        entry: python -B tools/check_source.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: python-correctness
+        name: Python correctness
+        entry: ruff check
+        language: python
+        additional_dependencies: [ruff==0.14.5]
+        types: [python]

@@ -224,6 +224,15 @@ class ExplainabilityService:
                 "contribution": contribution,
                 "reason": reasons.get(key) or "Motivazione non registrata",
             })
+        neutral = self._num(env.get("environmental_neutral_contribution"))
+        if neutral is not None:
+            rows.append({
+                "key": "neutral", "label": "Contributo neutro per dati assenti o proxy",
+                "score": 50.0, "status": "neutro", "weight": None,
+                "effective_weight": max(0.0, 100.0 - sum(effective_weights.values())),
+                "contribution": neutral,
+                "reason": "Il peso mancante resta neutro; non viene redistribuito sugli altri indizi",
+            })
         return rows
 
 
@@ -529,6 +538,8 @@ class ExplainabilityService:
             "macro_rows": macro_rows,
             "environment_rows": env_rows,
             "environment_group": selected_env.get("environmental_group") or substrate_resolution.get("group") or "unknown",
+            "environment_evidence_coverage": selected_env.get("environmental_available_weight"),
+            "environment_quality_coverage": selected_env.get("environmental_quality_coverage"),
             "substrate_resolution": substrate_resolution,
             "ecological_resolution": {
                 "substrate": substrate_resolution,

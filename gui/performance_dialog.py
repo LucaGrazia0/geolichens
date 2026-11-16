@@ -1,9 +1,11 @@
+from ..core.qgis_compat import LayerType
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QCheckBox, QTableWidget,
     QTableWidgetItem, QFileDialog, QMessageBox, QGroupBox, QTextEdit
 )
-from qgis.core import QgsApplication, QgsProject, QgsMapLayerType
+from qgis.core import Qgis, QgsProject
+from ..services import diagnostics_service
 
 
 class PerformanceDialog(QDialog):
@@ -21,6 +23,11 @@ class PerformanceDialog(QDialog):
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
+        self.chkDiagnostics = QCheckBox("Registra dettagli diagnostici nel pannello Messaggi di log di QGIS")
+        self.chkDiagnostics.setToolTip("Attiva i dettagli nella scheda GeoLichen del registro QGIS. Gli avvisi restano disponibili anche se disattivato.")
+        self.chkDiagnostics.setChecked(diagnostics_service.enabled())
+        self.chkDiagnostics.toggled.connect(diagnostics_service.set_enabled)
+        layout.addWidget(self.chkDiagnostics)
 
         env_box = QGroupBox("Ambiente runtime")
         env_layout = QVBoxLayout(env_box)
@@ -35,7 +42,7 @@ class PerformanceDialog(QDialog):
             "Operazione", "Esecuzioni", "Errori", "Media (s)", "Min (s)", "Max (s)", "Ultima (s)"
         ])
         self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table, 1)
 
@@ -45,23 +52,27 @@ class PerformanceDialog(QDialog):
 
         buttons = QHBoxLayout()
         btn_refresh = QPushButton("Aggiorna")
+        btn_refresh.setToolTip('Aggiorna il riepilogo dei tempi di esecuzione e degli errori registrati.')
         btn_refresh.clicked.connect(self.refresh)
         buttons.addWidget(btn_refresh)
         btn_export = QPushButton("Esporta JSON")
+        btn_export.setToolTip('Salva il report delle prestazioni in un file JSON.')
         btn_export.clicked.connect(self.export_json)
         buttons.addWidget(btn_export)
         btn_clear = QPushButton("Azzera registro")
+        btn_clear.setToolTip('Cancella le misurazioni dal registro locale delle prestazioni.')
         btn_clear.clicked.connect(self.clear_records)
         buttons.addWidget(btn_clear)
         buttons.addStretch(1)
         btn_close = QPushButton("Chiudi")
+        btn_close.setToolTip('Chiude la finestra delle prestazioni.')
         btn_close.clicked.connect(self.close)
         buttons.addWidget(btn_close)
         layout.addLayout(buttons)
         self.refresh()
 
     def _environment(self):
-        qgis_version = getattr(QgsApplication, "qgisVersion", lambda: "non disponibile")()
+        qgis_version = Qgis.QGIS_VERSION
         return self.service.runtime_environment(qgis_version=qgis_version)
 
     def refresh(self):
@@ -79,12 +90,12 @@ class PerformanceDialog(QDialog):
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 if col > 0:
-                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row_idx, col, item)
         project = QgsProject.instance()
         layers = list(project.mapLayers().values())
-        raster_count = sum(1 for layer in layers if layer.type() == QgsMapLayerType.RasterLayer)
-        vector_count = sum(1 for layer in layers if layer.type() == QgsMapLayerType.VectorLayer)
+        raster_count = sum(1 for layer in layers if layer.type() == LayerType.Raster)
+        vector_count = sum(1 for layer in layers if layer.type() == LayerType.Vector)
         invalid = [layer.name() for layer in layers if not layer.isValid()]
         self.lblProject.setText(
             f"Progetto: {len(layers)} layer ({vector_count} vettoriali, {raster_count} raster). "

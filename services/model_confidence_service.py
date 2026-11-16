@@ -107,6 +107,24 @@ class ModelConfidenceService:
     def _data_completeness(self, row):
         env = row.get("env") or {}
         constraints = row.get("constraints") or {}
+        states = env.get("environmental_evidence_status")
+        if isinstance(states, dict):
+            # Preferences and neutral defaults are not observed candidate data.
+            checks = {
+                "quota cartellino": self._present(env.get("record_altitude")),
+                "DEM": self._present(env.get("altitude")),
+                "pendenza": self._present(env.get("slope")),
+                "esposizione": self._present(env.get("aspect")),
+                "profilo ITALIC": bool(env.get("italic_profile_used")),
+                "accessibilità": self._present(env.get("trail_dist_m")) or self._present(env.get("context_dist_m")),
+            }
+            names = {"substrate": "substrato", "lithology": "litologia", "ph": "pH",
+                     "habitat": "habitat", "tree_forest": "supporto arboreo/contesto forestale"}
+            for key, name in names.items():
+                if states.get(key) != "non applicabile":
+                    checks[name] = states.get(key) == "valutato"
+            count = sum(bool(value) for value in checks.values())
+            return count / float(len(checks)), [name for name, value in checks.items() if value]
         checks = {
             "quota": self._present(env.get("record_altitude")) or self._present(constraints.get("altitude_min")),
             "DEM": self._present(env.get("altitude")),

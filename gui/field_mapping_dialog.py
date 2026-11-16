@@ -4,12 +4,12 @@ from ..services.field_mapper_service import FieldMapperService
 
 
 class FieldMappingDialog(QDialog):
-    def __init__(self, field_names, parent=None):
+    def __init__(self, field_names, parent=None, mapping=None):
         super().__init__(parent)
         self.setWindowTitle("Configura campi input")
         self.field_names = list(field_names)
         self.mapper = FieldMapperService()
-        self.suggested = self.mapper.suggest_mapping(self.field_names)
+        self.suggested = mapping if mapping is not None else self.mapper.suggest_mapping(self.field_names)
         self.combos = {}
 
         layout = QVBoxLayout(self)
@@ -42,7 +42,9 @@ class FieldMappingDialog(QDialog):
             form.addRow(label, combo)
 
         layout.addLayout(form)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setToolTip('Applica l’associazione dei campi della tabella.')
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setToolTip('Annulla questo passaggio senza confermare i dati.')
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)

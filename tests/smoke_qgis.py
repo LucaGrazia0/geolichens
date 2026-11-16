@@ -6,6 +6,7 @@ external services are needed. This checks loading, not scientific accuracy.
 
 import importlib
 import importlib.util
+import configparser
 import json
 from pathlib import Path
 import sys
@@ -29,6 +30,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        Handler.last_get_agent = self.headers.get('User-Agent', '')
         if self.path.startswith("/slow"):
             time.sleep(0.4)
         status = 403 if self.path.startswith("/error") else 200
@@ -38,6 +40,28 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"message": "caffè"}).encode("utf-8"))
         except BrokenPipeError:
             pass
+
+    def do_POST(self):
+        if self.path.startswith('/slow-overpass'):
+            time.sleep(3)
+            try:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"elements":[]}')
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+        Handler.last_post = (body, self.headers.get('User-Agent', ''))
+        valid = body.startswith(b'data=') and self.headers.get('User-Agent', '').startswith('GeoLichen/')
+        status = 429 if self.path.startswith('/rate-limit') else (200 if valid else 400)
+        self.send_response(status)
+        self.end_headers()
+        elements = []
+        if self.path.startswith('/trails'):
+            elements = [{'type': 'way', 'id': 123, 'tags': {'highway': 'path'},
+                         'geometry': [{'lon': 10.198, 'lat': 46.05}, {'lon': 10.202, 'lat': 46.05}]}]
+        self.wfile.write(json.dumps({'elements': elements}).encode())
 
 
 class Iface(QObject):
@@ -59,10 +83,10 @@ class Iface(QObject):
     def activeLayer(self):
         return None
 
-    def addPluginToVectorMenu(self, menu, action):
+    def addPluginToMenu(self, menu, action):
         self.actions.append(action)
 
-    def removePluginVectorMenu(self, menu, action):
+    def removePluginMenu(self, menu, action):
         self.actions.remove(action)
 
     def addToolBarIcon(self, action):
@@ -80,8 +104,8 @@ class Iface(QObject):
 
 def main():
     with tempfile.TemporaryDirectory(prefix="geolichen_smoke_") as temporary:
-        QSettings.setDefaultFormat(QSettings.IniFormat)
-        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, temporary)
+        QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+        QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, temporary)
         app = QgsApplication([], True, temporary)
         app.initQgis()
         spec = importlib.util.spec_from_file_location(
@@ -164,6 +188,10 @@ def main():
         base = f"http://127.0.0.1:{server.server_port}"
         try:
             assert json.loads(fetch_text(base, timeout=2))["message"] == "caffè"
+            fetch_text(base, timeout=2, headers={'User-Agent': 'GeoLichen/test'})
+            assert Handler.last_get_agent == 'GeoLichen/test'
+            fetch_text(base, timeout=2)
+            assert not Handler.last_get_agent.startswith('GeoLichen/')
             assert italic._fetch_json(base)["message"] == "caffè"
             try:
                 fetch_text(base + "/error?key=DO_NOT_EXPOSE", timeout=2)
@@ -178,26 +206,58 @@ def main():
                 assert time.monotonic() - start < 0.35
             else:
                 raise AssertionError("Timeout did not cancel the request")
+            from geolichen.services.overpass_transport import download_overpass, _cooldown_until
+            payload, error, endpoint = download_overpass('query', (base + '/overpass',), 3)
+            assert payload == {'elements': []} and error is None, (error, Handler.last_post)
+            payload, error, endpoint = download_overpass('query', (base + '/rate-limit',), 3)
+            assert payload is None and '429' in error, error
+            _cooldown_until.clear()
+            print('PASS: real QGIS Overpass POST, application identification and HTTP 429 handling')
+            started = time.monotonic()
+            payload, error, _ = download_overpass('query', (base + '/slow-overpass',), 0.05)
+            assert payload is None and 'Tempo limite' in error, error
+            assert time.monotonic() - started < 2.8, 'Overpass total deadline was not enforced'
+            print('PASS: stalled Overpass POST aborted at total deadline without caching a response')
+            # A queued response arriving after the old total deadline must now
+            # succeed when given an independent network-wait budget.
+            payload, error, _ = download_overpass('query', (base + '/slow-overpass',),
+                                                  0.05, wait_timeout_s=4)
+            assert payload == {'elements': []} and error is None, error
+            print('PASS: queued Overpass response accepted beyond the query-runtime margin')
+            from geolichen.services.osm_trail_service import OsmTrailService
+            from qgis.core import QgsGeometry, QgsPointXY
+            buffer = QgsGeometry.fromPointXY(QgsPointXY(10.2, 46.05)).buffer(.001, 48)
+            trails = OsmTrailService(endpoint=base + '/trails', query_margin_m=0)
+            trails.endpoints = (base + '/trails',)
+            result = trails.fetch(buffer)
+            assert result.success and result.feature_count == 1, result.error
+            geometry = next(result.layer.getFeatures()).geometry()
+            assert geometry.difference(buffer).isEmpty()
+            assert trails.fetch(buffer).from_cache
+            print('PASS: actual local HTTP trail download, exact buffer clipping, layer creation and cached reuse')
         finally:
             server.shutdown()
             server.server_close()
         print("PASS: QGIS HTTP success, ITALIC JSON, HTTP errors and timeout")
 
         from geolichen.services.geocoding_service import GeocodingService
-        service = GeocodingService(api_key="DEMO_KEY")
-        with patch("geolichen.services.geocoding_service.fetch_text",
+        service = GeocodingService()
+        with patch("geolichen.services.osm_geocoding_service.fetch_text",
                    return_value='{"features": []}') as fetch:
             assert service._call("Edolo")["features"] == []
-            assert "key=DEMO_KEY" in fetch.call_args.args[0]
-        with patch("geolichen.services.geocoding_service.fetch_text",
+            assert "photon.komoot.io" in fetch.call_args.args[0]
+            assert "key=" not in fetch.call_args.args[0]
+        with patch("geolichen.services.osm_geocoding_service.fetch_text",
                    side_effect=OSError("HTTP 403 from remote service.")):
-            result = service.geocode_ranked("Edolo")
+            result = service.geocode_ranked("Breno")
             assert not result.ok and "403" in result.error
-        print("PASS: MapTiler request and failure handling")
+        print("PASS: Photon/OSM request without API key and failure handling")
 
         from geolichen.services.release_readiness_service import ReleaseReadinessService
         report = ReleaseReadinessService(ROOT).run()
-        assert report["metadata"]["version"] == "15.5.18"
+        metadata = configparser.ConfigParser(interpolation=None)
+        metadata.read(ROOT / "metadata.txt", encoding="utf-8")
+        assert report["metadata"]["version"] == metadata["general"]["version"]
         assert all(check["ok"] for check in report["checks"]
                    if check["name"].startswith("File richiesto:"))
         print(f"Release readiness: {report['blocking_failures']} outstanding checks (public URLs may be pending)")

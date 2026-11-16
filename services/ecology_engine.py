@@ -1,4 +1,5 @@
 from ._shared_geo_utils import to_float as _shared_to_float
+from .environmental_evidence_service import EnvironmentalEvidenceService
 
 
 class EcologyEngine:
@@ -220,7 +221,7 @@ class EcologyEngine:
             amin, amax = amax, amin
         return amin, amax
 
-    def compute_score(self, profile, env):
+    def compute_score(self, profile, env, constraints=None):
         """
         GeoLichen 1.8.2 - ITALIC ecological similarity.
 
@@ -239,7 +240,7 @@ class EcologyEngine:
         habitat = self._as_list(profile.get("habitat"))
         substrata = self._as_list(profile.get("substrata"))
         profile_rock = self._clean(profile.get("rock_type"))
-        constraints = self.compute_constraints(profile)
+        constraints = self.compute_constraints(profile) if constraints is None else constraints
         layer_decision = constraints.get("layer_decision") or {}
         use_geology = layer_decision.get("use_geology", True)
         use_soil = layer_decision.get("use_soil", True)
@@ -321,32 +322,14 @@ class EcologyEngine:
         altitude_score = max(-18.0, min(22.0, altitude_score))
         ecological_score += altitude_score
 
-        # 4) Habitat sintetico - max 16
+        # Habitat evidence is numeric and independent of quota/slope/substrate.
+        evidence = EnvironmentalEvidenceService().evaluate(env, constraints)
+        habitat_item = evidence["habitat"]
         habitat_score = 0.0
-        if "alpino" in habitat and altitude is not None and altitude >= 1800:
-            habitat_score += 4
-        if "rupicolo" in habitat and (env_substrate == "roccia" or (slope is not None and slope >= 25) or env_rock):
-            habitat_score += 4
-        if "aperto" in habitat and env_substrate not in {"bosco", "albero"}:
-            habitat_score += 3
-        if "bosco" in habitat and env_substrate in {"bosco", "albero"}:
-            habitat_score += 4
-        if "secco" in habitat:
-            if env_humidity == "bassa":
-                habitat_score += 3
-            elif slope is not None and slope >= 30:
-                habitat_score += 2
-            elif env_humidity == "alta":
-                habitat_score -= 2
-        if "umido" in habitat:
-            if env_humidity == "alta":
-                habitat_score += 3
-            elif env_humidity == "bassa":
-                habitat_score -= 2
-        habitat_score = max(-8.0, min(16.0, habitat_score))
-        ecological_score += habitat_score
-        if habitat_score:
-            details.append(f"coerenza habitat ITALIC/GIS ({round(habitat_score,1)})")
+        if habitat_item["score"] is not None:
+            habitat_score = max(-8.0, min(16.0, (habitat_item["score"] - 50.0) / 4.0)) * habitat_item["quality"]
+            ecological_score += habitat_score
+            details.append(f"coerenza habitat ITALIC/GIS ({habitat_score:.1f}); {habitat_item['reason']}")
 
         # 5) Pendenza/topografia - max 7
         topo_score = 0.0
@@ -426,6 +409,7 @@ class EcologyEngine:
             "accessibility_score": accessibility_score,
             "details": details,
             "constraints": constraints,
+            "environmental_evidence": evidence,
         }
 
     def _italic_range(self, profile, base_name):

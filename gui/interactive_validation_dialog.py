@@ -31,8 +31,8 @@ class InteractiveValidationDialog(QDialog):
         outer_layout = QVBoxLayout(self)
         self.scrollArea = QScrollArea(self)
         self.scrollArea.setWidgetResizable(True)
-        self.scrollArea.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.scrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scrollArea.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         content = QWidget(self.scrollArea)
         layout = QVBoxLayout(content)
         self.scrollArea.setWidget(content)
@@ -58,13 +58,16 @@ class InteractiveValidationDialog(QDialog):
 
         capture_row = QHBoxLayout()
         self.btnCapture = QPushButton("Seleziona posizione reale sulla mappa")
+        self.btnCapture.setToolTip('Clicca sulla mappa per inserire la posizione reale da usare come riferimento.')
         self.btnCenter = QPushButton("Usa centro della mappa")
+        self.btnCenter.setToolTip('Usa il centro attuale della mappa come posizione reale di riferimento.')
         self.btnCapture.clicked.connect(self._start_capture)
         self.btnCenter.clicked.connect(self._use_canvas_center)
         capture_row.addWidget(self.btnCapture); capture_row.addWidget(self.btnCenter)
         layout.addLayout(capture_row)
 
         self.btnCalculate = QPushButton("Calcola validazione")
+        self.btnCalculate.setToolTip('Calcola l’errore rispetto alla posizione nota e la copertura dell’incertezza.')
         self.btnCalculate.clicked.connect(self._calculate)
         layout.addWidget(self.btnCalculate)
 
@@ -75,12 +78,14 @@ class InteractiveValidationDialog(QDialog):
 
         export_row = QHBoxLayout()
         self.btnSave = QPushButton("Aggiungi al CSV di validazione")
+        self.btnSave.setToolTip('Aggiunge la validazione calcolata al file CSV scelto.')
         self.btnSave.setEnabled(False)
         self.btnSave.clicked.connect(self._save_csv)
         export_row.addWidget(self.btnSave); export_row.addStretch(1)
         layout.addLayout(export_row)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setToolTip('Chiude questa finestra.')
         buttons.rejected.connect(self.reject)
         outer_layout.addWidget(buttons)
 
@@ -120,9 +125,9 @@ class InteractiveValidationDialog(QDialog):
             self._host_dialog.hide()
         QApplication.processEvents()
 
-        self._capture_tool.setCursor(Qt.CrossCursor)
+        self._capture_tool.setCursor(Qt.CursorShape.CrossCursor)
         canvas.setMapTool(self._capture_tool)
-        canvas.setFocus(Qt.OtherFocusReason)
+        canvas.setFocus(Qt.FocusReason.OtherFocusReason)
         canvas.activateWindow()
         try:
             canvas.window().raise_()

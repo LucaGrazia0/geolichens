@@ -21,12 +21,23 @@ terms before using or redistributing external data.
 - [OpenStreetMap contributors](https://www.openstreetmap.org/copyright): data
   accessed through Overpass; observe ODbL and attribution requirements when
   distributing derived datasets. No downloaded OSM dataset is bundled.
-- [MapTiler](https://www.maptiler.com/): automatic geocoding requires the user's
-  key/account and is subject to the provider's terms and quotas. No key or
-  downloaded MapTiler dataset is included.
+- [Photon](https://github.com/komoot/photon) is queried as an external OSM-based
+  geocoding service; no Photon server code or dataset is bundled. Its public
+  [demo](https://photon.komoot.io/) is for moderate use without availability
+  guarantees. The URL is configurable for an appropriate private/self-hosted service.
+  [Overpass](https://overpass-api.de/) and [Private.coffee Overpass](https://overpass.private.coffee/)
+  provide OSM geometries, subject to availability and fair-use policies.
+  Requests identify GeoLichen. The public Nominatim endpoint is not used.
 - Specimen records, regional dictionaries, environmental layers and DEMs are
   supplied privately by the user and retain their own licenses. They are not
   included in the public source repository or release ZIP.
 
-The repository contains plugin source, documentation, license and developer
-scripts only. Test scripts generate disposable artificial input at runtime.
+## Interface image
+
+`gui/icons/locality_centroid.png` is the image supplied by the project owner for
+the locality-centroid action. The original PNG is embedded unchanged as a UI
+asset. It is not an environmental or specimen dataset.
+
+The repository contains plugin source, documentation, the interface image,
+license and developer scripts. Test scripts generate disposable artificial
+input at runtime.

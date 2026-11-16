@@ -1,0 +1,76 @@
+name: GeoLichen checks and package
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements/development.txt
+      - run: python -B tools/check_source.py
+      - run: ruff check .
+      - run: python -B tests/regression_release_tools.py
+  qgis:
+    needs: source
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: '3.40'
+            image: qgis/qgis:3.40.15-noble@sha256:d664f1eca1ef4f615efd92b944c90896622bc75f0446357dc50c2e56b379ddd9
+          - version: '4.2'
+            image: qgis/qgis:4.2.3-resolute@sha256:5aae850e0204da0cc60421dce614f8030791e46ec7a31836bf45909761c9b839
+    container:
+      image: ${{ matrix.image }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONPATH: /usr/share/qgis/python
+      QGIS_PREFIX_PATH: /usr
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Full regression checks in real QGIS runtime
+        run: python3 -B tools/run_checks.py --expect-qgis '${{ matrix.version }}' --report 'dist/checks-${{ matrix.version }}.json'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checks-qgis-${{ matrix.version }}
+          path: dist/checks-*
+          if-no-files-found: error
+  package:
+    needs: [source, qgis]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -B tools/check_source.py
+      - run: python -B tools/build_release.py --source-dir dist/public-source
+      - uses: actions/upload-artifact@v4
+        with:
+          name: geolichen-tested-package
+          path: |
+            dist/geolichen-*.zip
+            dist/geolichen-*.manifest.json
+            dist/public-source
+          include-hidden-files: true
+          if-no-files-found: error
+# No deployment, repository writes, secrets or QGIS catalogue upload.

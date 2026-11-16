@@ -6,6 +6,7 @@ import urllib.parse
 from html import unescape
 
 from .network_service import fetch_text
+from .diagnostics_service import log
 from .storage_service import profile_data_path
 
 try:
@@ -1070,14 +1071,8 @@ class ItalicService:
             return None
 
     def _debug_print_json(self, label, payload):
-        if not getattr(self, "DEBUG_ITALIC_JSON", False):
-            return
-        try:
-            print("\n===== ITALIC JSON DEBUG:", label, "=====")
-            print(json.dumps(payload, indent=2, ensure_ascii=False))
-            print("===== END ITALIC JSON DEBUG =====\n")
-        except Exception:
-            pass
+        # Never dump raw remote profiles or URLs into the shared console.
+        log("ITALIC", f"Risposta JSON: {type(payload).__name__}", "debug")
 
     def _ui_diag(self, diag):
         diag = diag or {}
@@ -1100,56 +1095,11 @@ class ItalicService:
         }
 
     def _print_debug_summary(self, original_name, normalized_name, match, diag, profile=None):
-        try:
-            print("\n===== ITALIC DEBUG =====")
-            print("ENGINE_VERSION:", self.ENGINE_VERSION)
-            print("INPUT:", original_name)
-            print("NORMALIZED:", normalized_name)
-            if self.index_service is not None:
-                print("INDEX_PATH:", getattr(self.index_service, "index_path", None))
-            print("INDEX_ATTEMPTS:", len((diag or {}).get("index_attempts") or []))
-            for attempt in ((diag or {}).get("index_attempts") or [])[:5]:
-                print(" - INDEX", "OK" if attempt.get("ok") else "NO", attempt.get("method"), attempt.get("accepted_name") or attempt.get("name"), attempt.get("error") or "")
-            if match:
-                print("MATCHED:", match.get("matched_name"))
-                print("ACCEPTED:", match.get("accepted_name"))
-                print("STATUS:", match.get("status"))
-                print("TAXON_ID:", match.get("taxon_id"))
-                print("MATCH_URL:", match.get("match_url"))
-            else:
-                print("MATCH: NONE")
-            if diag:
-                print("CANDIDATES:", diag.get("candidate_names"))
-                print("SELECTED_NAME:", diag.get("selected_name"))
-                print("SELECTED_TAXON_ID:", diag.get("selected_taxon_id"))
-                print("FINAL_STATUS:", diag.get("final_status"))
-                print("FINAL_REASON:", diag.get("final_reason"))
-                print("MATCH_ATTEMPTS:", len(diag.get("match_attempts") or []))
-                for attempt in (diag.get("match_attempts") or [])[:6]:
-                    print(" - MATCH", "OK" if attempt.get("ok") else "NO", attempt.get("method"), attempt.get("candidate_name"), attempt.get("url"), attempt.get("error") or "")
-                print("API_ATTEMPTS:", len(diag.get("api_attempts") or []))
-                for attempt in (diag.get("api_attempts") or [])[:8]:
-                    print(" - API", "OK" if attempt.get("ok") else "NO", attempt.get("method"), attempt.get("url"), attempt.get("error") or "")
-                print("TAXONPAGE_ATTEMPTS:", len(diag.get("taxonpage_attempts") or []))
-                for attempt in (diag.get("taxonpage_attempts") or [])[:6]:
-                    print(" - TAXONPAGE", "OK" if attempt.get("ok") else "NO", attempt.get("method"), attempt.get("url"), attempt.get("error") or "")
-            if profile:
-                print("PROFILE_SOURCE:", profile.get("source"))
-                print("PROFILE_DIAGNOSTIC:", profile.get("diagnostic"))
-                print("PROFILE_TAXON:", profile.get("scientific_name"))
-                print("PROFILE_URL:", profile.get("taxon_url"))
-                print("SUBSTRATA:", profile.get("substrata"))
-                print("ROCK_TYPE:", profile.get("rock_type"))
-                print("TREE_TYPE:", profile.get("tree_type"))
-                print("HABITAT:", profile.get("habitat"))
-                print("ECOLOGY_PRESENT:", bool(profile.get("ecology_traits") or profile.get("notes")))
-                print("REGIONS_PRESENT:", bool(profile.get("regions_distribution")))
-                print("ECOREGIONS_PRESENT:", bool(profile.get("ecoregions_distribution")))
-                print("ITALIC_ALT_CLASSES:", profile.get("italic_altitude_class_min"), profile.get("italic_altitude_class_max"))
-                print("ITALIC_ALT_METERS:", profile.get("altitudinal_distribution_min"), profile.get("altitudinal_distribution_max"))
-                print("ITALIC_ALT_SOURCE:", profile.get("altitudinal_distribution_source"))
-                print("PH_CLASSES:", profile.get("ph_of_the_substrata_min"), profile.get("ph_of_the_substrata_max"))
-                print("ARIDITY_CLASSES:", profile.get("aridity_min"), profile.get("aridity_max"))
-            print("========================\n")
-        except Exception as exc:
-            print("ITALIC DEBUG PRINT ERROR:", exc)
+        profile = profile or {}
+        cache = profile.get("cache_status", "non disponibile")
+        if cache == "expired_used_as_fallback":
+            log("ITALIC", "Servizio senza dati utili: utilizzato un profilo salvato scaduto; verificare la fonte.")
+        diag = diag or {}
+        counts = {key: len(diag.get(key) or []) for key in
+                  ("index_attempts", "match_attempts", "api_attempts", "taxonpage_attempts")}
+        log("ITALIC", f"Profilo: cache={cache}; tentativi={counts}", "debug")

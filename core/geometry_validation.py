@@ -4,6 +4,7 @@ The module deliberately avoids importing QGIS. Runtime geometries are inspected
 through their public methods, which also makes the validator usable in light
 unit tests with geometry doubles.
 """
+from .enum_utils import enum_value
 from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple
 
@@ -20,7 +21,7 @@ def actual_geometry_type(geometry: Any) -> str:
     except Exception:
         pass
     try:
-        return _GEOMETRY_TYPE_NAMES.get(int(geometry.type()), "UNKNOWN")
+        return _GEOMETRY_TYPE_NAMES.get(enum_value(geometry.type()), "UNKNOWN")
     except Exception:
         return "UNKNOWN"
 

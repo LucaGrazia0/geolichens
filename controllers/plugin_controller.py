@@ -1,29 +1,37 @@
 import re
 import math
-from qgis.PyQt.QtCore import QSettings, pyqtSignal, Qt, QEventLoop, QVariant
+import json
+from ..core.qgis_compat import FieldType, GeometryType, LayerType, RASTER_IDENTIFY_VALUE
+from qgis.PyQt.QtCore import QSettings, pyqtSignal, Qt, QEventLoop, QTimer
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import QMessageBox, QDialog
 from qgis.PyQt import sip
 from qgis.core import (
+    NULL,
     QgsProject,
     QgsWkbTypes,
     QgsGeometry,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
-    QgsMapLayerType,
     QgsPointXY,
-    QgsRaster,
     QgsVectorLayer,
     QgsField,
     QgsFeature,
     QgsMarkerSymbol,
+    QgsSpatialIndex,
 )
 from qgis.gui import QgsRubberBand, QgsMapToolEmitPoint, QgsVertexMarker
 
 from ..gui.field_mapping_dialog import FieldMappingDialog
+from ..models.input_mapping_model import InputMappingModel
+from ..services.field_mapper_service import FieldMapperService
+from ..services.diagnostics_service import log as log_diagnostic
 from ..gui.candidate_selector_dialog import CandidateSelectorDialog
 from ..gui.confirm_point_dialog import ConfirmPointDialog
+from ..gui.ecological_point_choice_dialog import EcologicalPointChoiceDialog, CandidateUseDialog
 from ..gui.reuse_confirmed_point_dialog import ReuseConfirmedPointDialog
+from ..gui.copy_point_targets_dialog import CopyPointTargetsDialog
+from ..services.confirmation_fields_service import ConfirmationFieldsService
 from ..gui.redefine_buffer_dialog import RedefineBufferDialog
 from ..services.geocoding_service import GeocodingService
 from ..services.initial_boundary_service import InitialBoundaryService
@@ -45,6 +53,7 @@ from ..services.context_engine import ContextEngine
 from ..services.search_area_service import SearchAreaService
 from ..services.explainability_service import ExplainabilityService
 from ..services._shared_geo_utils import local_metric_crs
+from ..services.grid_resolution_service import grid_step_for_radius
 from ..core.terrain_engine import TerrainPreparationEngine
 from ..core.summit_detection_engine import SummitDetectionEngine
 from ..core.terrain_polygon_engine import TerrainPolygonReconstructionEngine
@@ -57,6 +66,14 @@ class CandidateSnapMapTool(QgsMapToolEmitPoint):
     """Map tool con anteprima magnetica verso il candidato più vicino."""
 
     canvasMoved = pyqtSignal(object)
+    captureCancelled = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.captureCancelled.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def canvasMoveEvent(self, event):
         try:
@@ -73,6 +90,10 @@ class PluginController:
         self.performance_service = performance_service
         self.active_layer = None
         self.input_layer = None
+        self._selection_layer = None
+        self._record_selection_slots = {}
+        self._requested_input_layer_id = None
+        self._explicit_record_choice = False
         self.mapping = None
         self.current_feature = None
         # FASE 1 GBIF: geometrie mantenute separate.
@@ -101,6 +122,9 @@ class PluginController:
         self.current_environment_result = None
         self.current_suitability_result = None
         self.current_selected_candidate = None
+        self._analysis_record_key = None
+        self._last_search_geometry_wkb = None
+        self.current_centroid_result = None
         # FASE 13: risultati diagnostici e integrazione della geometria terrain.
         self.current_terrain_context = None
         self.current_summit_result = None
@@ -113,6 +137,7 @@ class PluginController:
         self.current_selection_metadata = None
         # FASE 5.5: contesto geografico centralizzato, inizialmente solo informativo.
         self.current_locality_context = None
+
         self.rubber_band = None
         self.last_feature = None
         self.manual_point_tool = None
@@ -134,6 +159,17 @@ class PluginController:
         self.redefine_buffer_feature = None
         self.redefine_buffer_radius_m = None
         self.confirm_point_tool = None
+        self.confirm_previous_tool = None
+        self._candidate_snap_cache = None
+        self._candidate_preview_cache = {}
+        self._candidate_preview_pending = None
+        self._candidate_preview_timer = QTimer(self.dock)
+        self._candidate_preview_timer.setSingleShot(True)
+        self._candidate_preview_timer.setInterval(150)
+        self._candidate_preview_timer.timeout.connect(self._finish_candidate_preview)
+        self._candidate_dialog_busy = False
+        self._ecological_choice_running = False
+        self._candidate_dialog = None
         self.confirm_snap_marker = None
         self.confirmed_point_marker = None
         self.confirmed_results_layer_id = None
@@ -189,6 +225,13 @@ class PluginController:
         self.on_layer_changed(self.iface.activeLayer())
 
     def cleanup(self):
+        self.stop_confirm_point_capture()
+        if self._candidate_dialog is not None and not sip.isdeleted(self._candidate_dialog):
+            self._candidate_dialog.reject()
+        for layer, slot in self._record_selection_slots.values():
+            if self._layer_supports_fields(layer):
+                layer.selectionChanged.disconnect(slot)
+        self._record_selection_slots.clear()
         try:
             if self._iface_layer_changed_connected:
                 self.iface.currentLayerChanged.disconnect(self.on_layer_changed)
@@ -204,8 +247,9 @@ class PluginController:
         except Exception:
             pass
         try:
-            if self.active_layer and hasattr(self.active_layer, 'selectionChanged'):
-                self.active_layer.selectionChanged.disconnect(self._on_selection_changed)
+            if self._layer_supports_fields(self._selection_layer):
+                self._selection_layer.selectionChanged.disconnect(self._on_selection_changed)
+            self._selection_layer = None
         except Exception:
             pass
         try:
@@ -227,8 +271,15 @@ class PluginController:
         self._refresh_layers()
 
     def _connect_signals(self):
+        self.dock.cmbMunicipalityBoundaryLayer.currentIndexChanged.connect(self._update_municipality_boundary_fields)
+        self.dock.cmbMunicipalityBoundaryField.currentTextChanged.connect(self._save_municipality_boundary_settings)
+        self.dock.chkUseLocalityArchive.toggled.connect(
+            lambda enabled: QSettings().setValue('geolichen/use_locality_archive', enabled))
+        self.dock.btnLocalityArchive.clicked.connect(self._open_locality_archive)
+        self.dock.cmbRecordLayer.currentIndexChanged.connect(self._on_record_layer_chosen)
         self.dock.btnConfigureFields.clicked.connect(self.configure_fields)
         self.dock.btnAnalyze.clicked.connect(self.analyze_selected_record)
+        self.dock.btnUseLocalityCentroid.clicked.connect(self.finish_with_locality_centroid)
         self.dock.btnItalic.clicked.connect(self.run_italic_lookup)
         if hasattr(self.dock, 'btnManualPoint'):
             self.dock.btnManualPoint.clicked.connect(self.start_manual_point_capture)
@@ -236,13 +287,12 @@ class PluginController:
             self.dock.btnManualLine.clicked.connect(self.start_manual_line_capture)
         if hasattr(self.dock, 'btnRedefineBuffer'):
             self.dock.btnRedefineBuffer.clicked.connect(self.start_redefine_buffer_capture)
-        if hasattr(self.dock, 'btnConfirmPoint'):
-            self.dock.btnConfirmPoint.clicked.connect(self.start_confirm_point_capture)
         if hasattr(self.dock, 'btnReuseConfirmedPoint'):
             self.dock.btnReuseConfirmedPoint.clicked.connect(self.reuse_confirmed_point)
         self.dock.btnCreateGroupLito.clicked.connect(self.create_group_lito)
         if hasattr(self.dock, 'btnHabitatSuitability'):
-            self.dock.btnHabitatSuitability.clicked.connect(self.find_habitat_suitability_point)
+            self.dock.btnHabitatSuitability.clicked.connect(self.start_ecological_point_selection)
+        self.dock.btnAutomaticPoint.clicked.connect(self.find_and_save_automatic_point)
         self.dock.cmbGeologyLayer.currentTextChanged.connect(
             lambda _: self._update_fields_for_layer(self.dock.cmbGeologyLayer, self.dock.cmbGeologyField)
         )
@@ -539,16 +589,16 @@ class PluginController:
 
 
     def _warn(self, msg):
+        log_diagnostic("Operazione", msg)
         self.dock.set_status(msg)
-        QMessageBox.warning(self.iface.mainWindow(), 'Lombardy Lichen Plugin', msg)
+        QMessageBox.warning(self.iface.mainWindow(), 'GeoLichen', msg)
 
 
     def _layer_is_vector_tile(self, layer):
         if layer is None:
             return False
         try:
-            # QGIS 3.x exposes VectorTileLayer enum on QgsMapLayerType.
-            return layer.type() == QgsMapLayerType.VectorTileLayer and layer.isValid()
+            return layer.type() == LayerType.VectorTile and layer.isValid()
         except Exception:
             try:
                 return layer.__class__.__name__ == "QgsVectorTileLayer" and layer.isValid()
@@ -556,14 +606,13 @@ class PluginController:
                 return False
 
     def _accessibility_layer_items(self):
-        """Lista layer selezionabili per accessibilità: vettoriali classici + vector tiles."""
+        """Only line-vector layers can provide usable road/trail distances."""
         items = []
-        for lyr in QgsProject.instance().mapLayers().values():
+        for layer in QgsProject.instance().mapLayers().values():
             try:
-                if self._layer_supports_fields(lyr):
-                    items.append(lyr.name())
-                elif self._layer_is_vector_tile(lyr):
-                    items.append(f"{lyr.name()} [VectorTile]")
+                if (self._layer_supports_fields(layer)
+                        and layer.geometryType() == GeometryType.Line):
+                    items.append(layer.name())
             except Exception:
                 continue
         return sorted(items)
@@ -573,7 +622,7 @@ class PluginController:
         if layer is None:
             return False
         try:
-            return layer.type() == QgsMapLayerType.RasterLayer and layer.isValid()
+            return layer.type() == LayerType.Raster and layer.isValid()
         except Exception:
             return False
 
@@ -583,7 +632,7 @@ class PluginController:
         try:
             if sip.isdeleted(layer):
                 return False
-            if layer.type() != QgsMapLayerType.VectorLayer:
+            if layer.type() != LayerType.Vector:
                 return False
         except Exception:
             return False
@@ -592,40 +641,191 @@ class PluginController:
         except Exception:
             return False
 
+    def _usable_record_source(self, layer):
+        return (self._layer_supports_fields(layer) and layer.isValid()
+                and QgsProject.instance().mapLayer(layer.id()) is layer
+                and not layer.customProperty('geolichen/confirmed_results', False)
+                and not layer.customProperty('geolichen/output', False))
+
+    def _is_record_layer(self, layer):
+        if not self._usable_record_source(layer):
+            return False
+        return (self._saved_mapping_for_layer(layer) is not None
+                or self._mapping_matches_layer(self.mapping, layer)
+                or FieldMapperService().suggest_mapping(layer.fields().names()).is_valid())
+
     def _valid_input_or_active_layer(self):
-        """Restituisce un layer vettoriale ancora vivo, evitando wrapper SIP gia' eliminati."""
-        input_layer = getattr(self, 'input_layer', None)
-        if self._layer_supports_fields(input_layer):
-            return input_layer
-        if input_layer is not None:
+        """Resolve a live source selection before falling back to the saved table."""
+        project = QgsProject.instance()
+        current = self.input_layer if self._usable_record_source(self.input_layer) else None
+        if self.input_layer is not None and current is None:
             self.input_layer = None
+            self.mapping = None
+        requested = project.mapLayer(self._requested_input_layer_id or '')
+        active = self.iface.activeLayer()
+        selected = [layer for layer in project.mapLayers().values()
+                    if self._is_record_layer(layer) and layer.selectedFeatureCount() > 0]
+        saved_id, _ = project.readEntry('GeoLichen', 'input_layer_id', '')
+        saved = project.mapLayer(saved_id)
+        if (self._usable_record_source(requested)
+                and (requested.selectedFeatureCount() > 0 or self._explicit_record_choice)):
+            target = requested
+        elif active in selected:
+            target = active
+        elif len(selected) == 1:
+            target = selected[0]
+        elif current in selected:
+            target = current
+        elif len(selected) > 1:
+            return None
+        elif current is not None:
+            target = current
+        elif self._saved_mapping_for_layer(saved) is not None:
+            target = saved
+        elif self._usable_record_source(active):
+            target = active
+        else:
+            return None
+        if target is not self.input_layer:
+            mapping = self._saved_mapping_for_layer(target)
+            if mapping is None and self._mapping_matches_layer(self.mapping, target):
+                mapping = self.mapping
+            self.input_layer = target
+            self.mapping = mapping
+            self.last_feature = None
+            self._watch_input_selection(target)
+            if mapping is not None:
+                self.dock.set_mapping_summary(mapping)
+        combo = self.dock.cmbRecordLayer
+        index = combo.findData(target.id())
+        combo.blockSignals(True)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+        return target
 
-        active_layer = getattr(self, 'active_layer', None)
-        if self._layer_supports_fields(active_layer):
-            return active_layer
-        if active_layer is not None:
-            self.active_layer = None
+    def _refresh_record_layers(self):
+        project = QgsProject.instance()
+        sources = [layer for layer in project.mapLayers().values()
+                   if self._usable_record_source(layer)]
+        source_ids = {layer.id() for layer in sources}
+        for layer_id, (layer, slot) in list(self._record_selection_slots.items()):
+            if layer_id not in source_ids:
+                if self._layer_supports_fields(layer):
+                    layer.selectionChanged.disconnect(slot)
+                del self._record_selection_slots[layer_id]
+        for layer in sources:
+            if layer.id() not in self._record_selection_slots:
+                slot = lambda *_, source=layer: self._on_record_selection(source)
+                layer.selectionChanged.connect(slot)
+                self._record_selection_slots[layer.id()] = (layer, slot)
+        combo = self.dock.cmbRecordLayer
+        current_id = self.input_layer.id() if self._usable_record_source(self.input_layer) else ''
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem('Seleziona la tabella record', '')
+        names = [layer.name() for layer in sources]
+        for layer in sorted(sources, key=lambda item: (item.name().casefold(), item.id())):
+            name = layer.name()
+            if names.count(name) > 1:
+                name += ' [' + layer.id()[-8:] + ']'
+            combo.addItem(name, layer.id())
+        combo.setCurrentIndex(max(0, combo.findData(current_id)))
+        combo.blockSignals(False)
 
-        return None
+    def _on_record_selection(self, layer):
+        # Selection in a detached attribute table may leave iface.activeLayer()
+        # pointing to another table. Remember the actual signal's source.
+        if self._is_record_layer(layer) and layer.selectedFeatureCount() > 0:
+            if self.active_manual_capture_mode is not None:
+                captured = (self.manual_line_feature if self.active_manual_capture_mode == 'line'
+                            else self.manual_point_feature)
+                if (layer is not self.input_layer or captured is None
+                        or layer.selectedFeatureIds() != [captured.id()]):
+                    self._cancel_active_manual_capture(restore_previous=True)
+            self._requested_input_layer_id = layer.id()
+            self._explicit_record_choice = False
+            self._valid_input_or_active_layer()
+            self._on_selection_changed()
+
+    def _on_record_layer_chosen(self, index):
+        if self.active_manual_capture_mode is not None:
+            self._cancel_active_manual_capture(restore_previous=True)
+        self._requested_input_layer_id = self.dock.cmbRecordLayer.itemData(index) or None
+        self._explicit_record_choice = bool(self._requested_input_layer_id)
+        source = self._valid_input_or_active_layer()
+        if source is not None:
+            self._watch_input_selection(source)
+            self._on_selection_changed()
+
+    def _mapping_matches_layer(self, mapping, layer):
+        return (self._layer_supports_fields(layer) and mapping is not None
+                and mapping.is_valid()
+                and all(not name or name in layer.fields().names()
+                        for name in mapping.to_dict().values()))
+
+    def _saved_mapping_for_layer(self, layer):
+        if not self._usable_record_source(layer):
+            return None
+        try:
+            values = json.loads(str(layer.customProperty('geolichen/input_mapping', '{}')))
+            mapping = InputMappingModel(**values)
+        except (TypeError, ValueError):
+            return None
+        return mapping if self._mapping_matches_layer(mapping, layer) else None
+
+    def _save_input_mapping(self):
+        self.input_layer.setCustomProperty('geolichen/input_mapping', json.dumps(self.mapping.to_dict()))
+        QgsProject.instance().writeEntry('GeoLichen', 'input_layer_id', self.input_layer.id())
+
+    def _watch_input_selection(self, layer):
+        if self._selection_layer is layer:
+            return
+        if self._layer_supports_fields(self._selection_layer):
+            self._selection_layer.selectionChanged.disconnect(self._on_selection_changed)
+        self._selection_layer = layer if self._layer_supports_fields(layer) else None
+        self.last_feature = None
+        if self._selection_layer is not None:
+            self._selection_layer.selectionChanged.connect(self._on_selection_changed)
+
+    def _selection_status(self, layer):
+        count = layer.selectedFeatureCount()
+        if count == 1:
+            detail = ('1 riga selezionata — pronto per l’analisi' if self._mapping_matches_layer(self.mapping, layer)
+                      else '1 riga selezionata — configura i campi input per iniziare')
+        elif count == 0:
+            detail = 'seleziona una riga nella tabella'
+        else:
+            detail = f'{count} righe selezionate — analisi: una riga; Copia su altri record: selezione multipla'
+        self.dock.set_status(f'Tabella: {layer.name()} • {detail}')
+
+    def _ensure_input_mapping(self):
+        layer = self._valid_input_or_active_layer()
+        if self._mapping_matches_layer(self.mapping, layer):
+            self._save_input_mapping()
+            return True
+        # After a reload, offer the suggested fields for the selected source
+        # instead of misreporting an existing selection as missing.
+        return self.configure_fields(layer)
 
     def on_layer_changed(self, layer):
         self._clear_confirmed_visuals()
-        try:
-            if self.active_layer and hasattr(self.active_layer, 'selectionChanged'):
-                self.active_layer.selectionChanged.disconnect(self._on_selection_changed)
-        except Exception:
-            pass
         self.active_layer = layer
+        if self._is_record_layer(layer) and layer.selectedFeatureCount() > 0:
+            if self.active_manual_capture_mode is not None and layer is not self.input_layer:
+                self._cancel_active_manual_capture(restore_previous=True)
+            self._requested_input_layer_id = layer.id()
+            self._explicit_record_choice = False
+        source = self._valid_input_or_active_layer()
+        self._watch_input_selection(source)
+        if source is not None:
+            self._on_selection_changed()
+            return
         if layer is None:
             self.dock.set_status('Nessun layer attivo')
             return
         if not self._layer_supports_fields(layer):
             self.dock.set_status('Layer attivo non compatibile: seleziona una tabella o un layer vettoriale con attributi')
             return
-        try:
-            layer.selectionChanged.connect(self._on_selection_changed)
-        except Exception:
-            pass
         self.dock.set_status('Configura i campi input oppure seleziona un record')
 
     def _on_selection_changed(self, *args):
@@ -636,6 +836,8 @@ class PluginController:
         if layer is None or not self._layer_supports_fields(layer):
             return
 
+        self._selection_status(layer)
+
         try:
             selected = layer.selectedFeatures()
         except Exception:
@@ -643,8 +845,7 @@ class PluginController:
 
         # Nessuna selezione (o selezione multipla): non lasciare cerchi residui.
         if len(selected) != 1:
-            if not selected:
-                self.last_feature = None
+            self.last_feature = None
             return
 
         feature = selected[0]
@@ -655,7 +856,7 @@ class PluginController:
 
     def _confirmed_visual_data_from_feature(self, layer, feature):
         """Recupera centro WGS84 e incertezza dalla feature selezionata."""
-        defaults = self._load_confirm_point_defaults()
+        defaults = ConfirmationFieldsService.resolve(layer, self._load_confirm_point_defaults())
         uncertainty_field = str(defaults.get("uncertainty_field") or "").strip()
         x_field = str(defaults.get("x_field") or "").strip()
         y_field = str(defaults.get("y_field") or "").strip()
@@ -673,7 +874,7 @@ class PluginController:
         # Priorità 1: geometria puntuale effettiva della feature.
         try:
             geom = feature.geometry()
-            if geom is not None and not geom.isEmpty() and QgsWkbTypes.geometryType(geom.wkbType()) == QgsWkbTypes.PointGeometry:
+            if geom is not None and not geom.isEmpty() and QgsWkbTypes.geometryType(geom.wkbType()) == GeometryType.Point:
                 geom = QgsGeometry(geom)
                 if layer.crs().isValid() and layer.crs() != wgs84:
                     geom.transform(QgsCoordinateTransform(layer.crs(), wgs84, QgsProject.instance()))
@@ -690,8 +891,10 @@ class PluginController:
         if point_wgs84 is None and x_field and y_field:
             try:
                 if layer.fields().indexOf(x_field) >= 0 and layer.fields().indexOf(y_field) >= 0:
-                    lon = float(feature[x_field])
-                    lat = float(feature[y_field])
+                    point = QgsPointXY(float(feature[x_field]), float(feature[y_field]))
+                    if layer.crs().isValid() and layer.crs() != wgs84:
+                        point = QgsCoordinateTransform(layer.crs(), wgs84, QgsProject.instance()).transform(point)
+                    lon, lat = point.x(), point.y()
                     if -180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0:
                         point_wgs84 = QgsPointXY(lon, lat)
             except Exception:
@@ -699,24 +902,37 @@ class PluginController:
 
         return point_wgs84, uncertainty_m
 
-    def configure_fields(self):
-        if self.active_layer is None or not self._layer_supports_fields(self.active_layer):
+    def configure_fields(self, layer=None):
+        if not self._layer_supports_fields(layer):
+            layer = self._valid_input_or_active_layer()
+        if not self._layer_supports_fields(layer):
             self._warn('Carica e seleziona prima una tabella o layer vettoriale con attributi.')
-            return
-        field_names = [f.name() for f in self.active_layer.fields()]
-        dlg = FieldMappingDialog(field_names, self.iface.mainWindow())
-        if dlg.exec_():
-            self.mapping = dlg.get_mapping()
-            self.input_layer = self.active_layer
-            if not self.mapping.is_valid():
+            return False
+        field_names = layer.fields().names()
+        previous = self.mapping if self.input_layer is layer else None
+        dlg = FieldMappingDialog(field_names, self.iface.mainWindow(), mapping=previous)
+        dlg.setWindowTitle(f'Configura campi input — {layer.name()}')
+        if dlg.exec():
+            mapping = dlg.get_mapping()
+            if not self._mapping_matches_layer(mapping, layer):
                 self._warn('Devi selezionare almeno Specie e uno tra Comune o Località.')
-                return
+                return False
+            self.mapping = mapping
+            self.input_layer = layer
+            self.active_layer = layer
+            self._requested_input_layer_id = layer.id()
+            self._save_input_mapping()
+            self._watch_input_selection(layer)
             self.dock.set_mapping_summary(self.mapping)
-            self.dock.set_status('Campi configurati')
+            self._on_selection_changed()
+            return True
+        return False
 
     def _refresh_layers(self):
         if self.dock is None or sip.isdeleted(self.dock):
             return
+        self._refresh_record_layers()
+        self._refresh_municipality_boundary_layers()
 
         vector_names = [
             lyr.name()
@@ -732,6 +948,10 @@ class PluginController:
             for lyr in QgsProject.instance().mapLayers().values()
             if self._layer_is_raster(lyr)
         ]
+        for layer in QgsProject.instance().mapLayers().values():
+            if (self._layer_is_raster(layer)
+                    and layer.customProperty('geolichen/base_grid_step_m', None) is not None):
+                self.habitat_suitability_service.configure_heatmap_display(layer)
 
         if hasattr(self.dock, "populate_dem_layer_list"):
             self.dock.populate_dem_layer_list(sorted(raster_names))
@@ -757,6 +977,54 @@ class PluginController:
             self._update_fields_for_layer(self.dock.cmbVegetationBeltLayer, self.dock.cmbVegetationBeltField)
 
 
+
+    def _refresh_municipality_boundary_layers(self):
+        combo = self.dock.cmbMunicipalityBoundaryLayer
+        selected = combo.currentData() or QgsProject.instance().readEntry('GeoLichen', 'municipality_boundary_layer', '')[0]
+        combo.blockSignals(True)
+        combo.clear(); combo.addItem('Nessun layer dei confini comunali', '')
+        for layer in sorted(QgsProject.instance().mapLayers().values(), key=lambda item: item.name()):
+            if self._layer_supports_fields(layer) and layer.geometryType() == GeometryType.Polygon:
+                combo.addItem(layer.name(), layer.id())
+        combo.setCurrentIndex(max(0, combo.findData(selected)))
+        combo.blockSignals(False)
+        self._update_municipality_boundary_fields()
+
+    def _update_municipality_boundary_fields(self, *args):
+        layer_id = self.dock.cmbMunicipalityBoundaryLayer.currentData() or ''
+        layer = QgsProject.instance().mapLayer(layer_id)
+        combo = self.dock.cmbMunicipalityBoundaryField
+        saved = QgsProject.instance().readEntry('GeoLichen', 'municipality_boundary_field', '')[0]
+        current = combo.currentText() or saved
+        combo.blockSignals(True); combo.clear(); combo.addItem('')
+        if self._layer_supports_fields(layer):
+            combo.addItems(layer.fields().names())
+        combo.setCurrentIndex(max(0, combo.findText(current)))
+        combo.blockSignals(False)
+        self._save_municipality_boundary_settings()
+
+    def _save_municipality_boundary_settings(self, *args):
+        project = QgsProject.instance()
+        project.writeEntry('GeoLichen', 'municipality_boundary_layer', self.dock.cmbMunicipalityBoundaryLayer.currentData() or '')
+        project.writeEntry('GeoLichen', 'municipality_boundary_field', self.dock.cmbMunicipalityBoundaryField.currentText())
+
+    def _configure_geocoding_evidence(self, municipality):
+        from ..services.municipality_boundary_service import MunicipalityBoundaryService
+        self.geocoding_service.use_archive = self.dock.chkUseLocalityArchive.isChecked()
+        self.geocoding_service.municipality_boundary = None
+        layer = QgsProject.instance().mapLayer(self.dock.cmbMunicipalityBoundaryLayer.currentData() or '')
+        field = self.dock.cmbMunicipalityBoundaryField.currentText()
+        if layer is not None and field:
+            try:
+                self.geocoding_service.municipality_boundary = MunicipalityBoundaryService.resolve(layer, field, municipality)
+            except Exception as exc:
+                self.dock.set_status(f'Confine comunale non disponibile: {exc}. Uso del contesto geografico del comune.')
+
+    def _open_locality_archive(self):
+        from ..gui.confirmed_localities_dialog import ConfirmedLocalitiesDialog
+        dialog = ConfirmedLocalitiesDialog(self.geocoding_service.archive, self.iface.mainWindow())
+        dialog.exec()
+        dialog.deleteLater()
 
     def _run_terrain_documented_geometry_pipeline(self, feature):
         """Run Phase 13A-D.3 for mountain localities and update SLGE safely.
@@ -838,7 +1106,7 @@ class PluginController:
             if hasattr(self.dock, "lstDemLayers"):
                 for i in range(self.dock.lstDemLayers.count()):
                     item = self.dock.lstDemLayers.item(i)
-                    if item and item.checkState() == Qt.Checked:
+                    if item and item.checkState() == Qt.CheckState.Checked:
                         layer = self._raster_layer_by_name(item.text())
                         if layer is not None and layer not in layers:
                             layers.append(layer)
@@ -884,7 +1152,7 @@ class PluginController:
             # provider GDAL e raster con NoData. sample() resta come fallback.
             value = None
             try:
-                identified = provider.identify(p, QgsRaster.IdentifyFormatValue)
+                identified = provider.identify(p, RASTER_IDENTIFY_VALUE)
                 if identified is not None and identified.isValid():
                     results = identified.results() or {}
                     value = results.get(int(band))
@@ -959,28 +1227,60 @@ class PluginController:
         field_names = [f.name() for f in layer.fields()] if self._layer_supports_fields(layer) else []
         self.dock.populate_field_combo(field_combo, field_names)
         if field_names and field_combo.currentText() == '':
-            preferred = ['GRUPPO_LITO', 'LITOLOGIA', 'DESCRIZION', 'DESCRIZIONE', 'UNITA', 'FORMAZIONE', 'NOME', 'name', 'nome']
+            if field_combo is self.dock.cmbSoilField:
+                preferred = ['ph', 'ph_h2o', 'ph_water', 'ph_cacl2', 'ph_kcl',
+                             'reazione', 'reaction', 'soil_ph', 'acidita',
+                             'soil_type', 'suolo', 'description', 'descrizione']
+            elif field_combo is self.dock.cmbGeologyField:
+                preferred = list(self.environment_overlay_service.GEOLOGY_FIELD_HINTS)
+            else:
+                preferred = ['tipo', 'type', 'nome', 'name', 'descrizione', 'description', 'vegetation_belt']
+            name_map = {name.lower(): name for name in field_names}
             for p in preferred:
-                idx = field_combo.findText(p)
+                idx = field_combo.findText(name_map.get(p.lower(), ''))
                 if idx >= 0:
-                    field_combo.setCurrentIndex(idx)
-                    break
+                    if field_combo.itemText(idx):
+                        field_combo.setCurrentIndex(idx)
+                        break
 
     def _selected_feature(self):
         layer = self._valid_input_or_active_layer()
         if layer is None or not self._layer_supports_fields(layer):
             return None
         self.active_layer = layer
-        features = layer.selectedFeatures()
-        if not features:
-            return self.last_feature
-        feature = features[0]
+        if layer.selectedFeatureCount() != 1:
+            self.last_feature = None
+            self._selection_status(layer)
+            return None
+        feature = next(layer.getSelectedFeatures(), None)
+        if feature is None or not feature.isValid():
+            self.last_feature = None
+            return None
         self.last_feature = feature
-        try:
-            layer.selectByIds([feature.id()])
-        except Exception:
-            pass
         return feature
+
+    def _require_current_analysis_record(self):
+        layer = self._valid_input_or_active_layer()
+        feature = self._selected_feature()
+        key = (layer.id(), feature.id()) if layer is not None and feature is not None else None
+        if key is None or key != self._analysis_record_key:
+            self._warn('La tabella o la riga selezionata è cambiata. Analizza il record selezionato '
+                       'o crea il suo buffer prima di usare i risultati ecologici.')
+            return False
+        return True
+
+    def _warn_record_selection(self):
+        layer = self._valid_input_or_active_layer()
+        if layer is None:
+            self._warn('Scegli la tabella record nel pannello GeoLichen.')
+            return
+        count = layer.selectedFeatureCount()
+        if count == 1:
+            self._warn(f'La riga selezionata in «{layer.name()}» non è più disponibile. '
+                       'Ricarica la tabella e seleziona nuovamente la riga.')
+        else:
+            self._warn(f'Tabella «{layer.name()}»: {count} righe selezionate. '
+                       'Seleziona una sola riga nella tabella indicata in «Tabella record».')
 
     def create_group_lito(self):
         geology_layer = self._layer_by_name(self.dock.cmbGeologyLayer.currentText())
@@ -1038,6 +1338,12 @@ class PluginController:
         ecological_extent=None,
     ):
         """Sincronizza le geometrie del controller nel LocalityContext."""
+        if search_extent is not None and not search_extent.isEmpty():
+            signature = bytes(search_extent.asWkb())
+            if signature != self._last_search_geometry_wkb:
+                self._invalidate_candidate_results()
+                self._last_search_geometry_wkb = signature
+            self._get_suitability_grid_step()
         return self.locality_interpreter.update_extents(
             self.current_locality_context,
             original_locality_extent=original_locality_extent,
@@ -1077,8 +1383,7 @@ class PluginController:
         self._cancel_active_manual_capture(restore_previous=False)
         is_manual_line = False
         self._ensure_aux_services()
-        if self.mapping is None:
-            self._warn('Configura prima i campi input.')
+        if not self._ensure_input_mapping():
             return
         layer = self._valid_input_or_active_layer()
         if layer is None or not self._layer_supports_fields(layer):
@@ -1087,9 +1392,11 @@ class PluginController:
         self.active_layer = layer
         feature = self._selected_feature()
         if feature is None:
-            self._warn('Seleziona una riga nella tabella.')
+            self._warn_record_selection()
             return
         self.current_feature = feature
+        self._analysis_record_key = (layer.id(), feature.id())
+        self._invalidate_candidate_results()
         self.current_environment_result = None
         self.original_locality_extent = None
         self.search_extent = None
@@ -1109,12 +1416,19 @@ class PluginController:
         self.current_boundary = None
         self.current_locality_context = None
 
+        self._get_suitability_grid_step()
         municipality = self._get_attr(feature, self.mapping.municipality)
         locality = self._get_attr(feature, self.mapping.locality)
         scientific_name = self._get_attr(feature, self.mapping.scientific_name)
 
-        api_key = self.dock.txtApiKey.text().strip()
-        self.geocoding_service.set_api_key(api_key)
+        try:
+            endpoint = self.dock.txtGeocoderUrl.text().strip()
+            self.geocoding_service.set_endpoint(endpoint)
+            self.geocoding_service.auto_expand = self.dock.chkAutoExpandSearchArea.isChecked()
+            QSettings().setValue('geolichen/photon_endpoint', endpoint)
+        except ValueError as exc:
+            self._warn(str(exc))
+            return
         # GeoLichen 2.5: area di ricerca persistente.
         # L'utente la sceglie una volta e resta valida finché non la cambia.
         try:
@@ -1144,15 +1458,15 @@ class PluginController:
             self.current_locality_context,
             parse_result=locality_parse_result,
         )
+        self._configure_geocoding_evidence(municipality)
+        self.dock.set_status('Ricerca della località in corso… Photon può richiedere fino a 80 secondi. '
+                             'Le località già confermate vengono cercate anche senza rete.')
+        self.dock.lblOperationalStatus.repaint()
         result = self.geocoding_service.geocode_prefer_municipality(
             locality_parse_result=locality_parse_result,
             locality_context=self.current_locality_context,
         )
-        if not result.ok:
-            self.dock.set_status(f'Geocoding fallito: {result.error}. Usa “Punto manuale + buffer” per indicare il punto sulla mappa.')
-            QMessageBox.warning(self.iface.mainWindow(), 'Lombardy Lichen Plugin', 'Geocoding fallito. Puoi usare il pulsante “Punto manuale + buffer” e cliccare un punto sulla mappa.')
-            return
-
+        # Even an empty/failed lookup can be refined by editing the name.
         result = self._select_geocoding_candidate_if_needed(result)
         if result is None:
             self.current_geocoding_result = None
@@ -1425,11 +1739,8 @@ class PluginController:
 
         env_result = self._merge_environment_results(env_record, env_italic, profile)
         env_result["constraint_metadata"] = list(self.current_constraint_metadata)
-        if is_manual_line:
-            env_result["search_geometry_mode"] = "manual_line"
-            env_result["manual_line_length_m"] = float(self.manual_line_length_m or 0.0)
-            env_result["manual_line_offset_m"] = float(self.manual_line_offset_m or radius_m)
-            env_result["search_geometry"] = QgsGeometry(self.search_extent)
+        # Manual corridor metadata is set by _analyze_manual_buffer, where
+        # radius_m and the captured line actually exist.
         self.current_environment_result = env_result
         self.ecological_candidate_extent = QgsGeometry(
             env_result['geometry'] if env_result.get('geometry') else self.search_extent
@@ -1473,6 +1784,7 @@ class PluginController:
         if env_result.get('blocking_reasons'):
             status_parts.append('Blocchi: ' + '; '.join(env_result['blocking_reasons'][:2]))
         self.dock.set_status(' | '.join(status_parts))
+        return True
 
 
     def _confirm_point_settings(self):
@@ -1597,7 +1909,7 @@ class PluginController:
                 circle = metric_geom.buffer(radius, 48)
                 if canvas_crs != metric:
                     circle.transform(QgsCoordinateTransform(metric, canvas_crs, QgsProject.instance()))
-                band = QgsRubberBand(canvas, QgsWkbTypes.PolygonGeometry)
+                band = QgsRubberBand(canvas, GeometryType.Polygon)
                 band.setColor(QColor(41, 182, 246, 230))
                 band.setFillColor(QColor(41, 182, 246, 40))
                 band.setWidth(2)
@@ -1608,38 +1920,16 @@ class PluginController:
             pass
         canvas.refresh()
 
-    @staticmethod
-    def _normalized_field_name(value):
-        text = str(value or "").strip().casefold()
-        return re.sub(r"[^a-z0-9]+", "", text)
-
     def _resolve_reuse_target_fields(self, layer):
-        """Risoluzione prudente dei campi di output per la copia rapida."""
-        defaults = self._load_confirm_point_defaults() or {}
-        names = [field.name() for field in layer.fields()]
-        normalized = {self._normalized_field_name(name): name for name in names}
+        return ConfirmationFieldsService.resolve(layer, self._load_confirm_point_defaults())
 
-        def choose(default_key, aliases, required=False):
-            configured = defaults.get(default_key)
-            if configured in names:
-                return configured
-            for alias in aliases:
-                found = normalized.get(self._normalized_field_name(alias))
-                if found:
-                    return found
-            if required:
-                raise ValueError(
-                    "Campi coordinate non configurati. Conferma una volta un punto oppure "
-                    "crea i campi coordinata X e coordinata Y."
-                )
-            return ""
-
+    def _copy_target_row(self, feature):
         return {
-            "x_field": choose("x_field", ("coordinata X", "coordinate X", "longitude", "decimalLongitude", "lon", "x"), True),
-            "y_field": choose("y_field", ("coordinata Y", "coordinate Y", "latitude", "decimalLatitude", "lat", "y"), True),
-            "dem_field": choose("dem_field", ("quota DEM", "altitude DEM", "elevation DEM", "altitude_m")),
-            "uncertainty_field": choose("uncertainty_field", ("incertezza GBIF (m)", "incertezza GBIF", "coordinateUncertaintyInMeters", "uncert_m")),
-            "model_radius_field": choose("model_radius_field", ("incertezza R55 S70", "incertezza R55-S70", "R55 S70", "model_r_m")),
+            'fid': feature.id(),
+            'record_id': self._feature_text(feature, getattr(self.mapping, 'record_id', None)) or str(feature.id()),
+            'taxon': self._feature_text(feature, getattr(self.mapping, 'scientific_name', None)),
+            'locality': self._feature_text(feature, getattr(self.mapping, 'locality', None)),
+            'municipality': self._feature_text(feature, getattr(self.mapping, 'municipality', None)),
         }
 
     def _confirmed_result_rows(self):
@@ -1650,7 +1940,8 @@ class PluginController:
             for field in layer.fields():
                 name = field.name()
                 try:
-                    row[name] = feature[name]
+                    value = feature[name]
+                    row[name] = None if value is None or value == NULL else value
                 except Exception:
                     row[name] = None
             rows.append(row)
@@ -1658,7 +1949,7 @@ class PluginController:
         return layer, rows
 
     def reuse_confirmed_point(self):
-        """Copia una georeferenziazione confermata nel record selezionato.
+        """Copy a confirmed georeference to explicitly selected destination rows.
 
         La funzione non esegue geocoding, DEM, scoring, raffinamento o heatmap.
         Riutilizza esclusivamente il risultato già validato dall'utente.
@@ -1667,25 +1958,17 @@ class PluginController:
         if layer is None or not self._layer_supports_fields(layer):
             self._warn("Nessun layer attivo compatibile.")
             return
-        target_feature = self._selected_feature()
-        if target_feature is None:
-            self._warn("Seleziona la riga di destinazione prima di copiare il punto.")
+        if not self._ensure_input_mapping():
             return
 
         try:
             _, rows = self._confirmed_result_rows()
-            # Non proporre come sorgente lo stesso record del layer corrente.
-            rows = [
-                row for row in rows
-                if not (str(row.get("source_lyr") or "") == layer.id()
-                        and int(row.get("source_fid") or -1) == int(target_feature.id()))
-            ]
             if not rows:
                 self._warn("Non sono presenti altri punti confermati da copiare.")
                 return
 
             dialog = ReuseConfirmedPointDialog(rows, self.iface.mainWindow())
-            if dialog.exec_() != QDialog.Accepted:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
                 self.dock.set_status("Copia del punto annullata.")
                 return
             source = dialog.selected_row()
@@ -1696,46 +1979,69 @@ class PluginController:
             lon = float(source.get("longitude"))
             lat = float(source.get("latitude"))
             point_wgs84 = QgsPointXY(lon, lat)
-            target_fields = self._resolve_reuse_target_fields(layer)
+            target_rows = [self._copy_target_row(feature) for feature in layer.getFeatures()
+                           if not (str(source.get('source_lyr') or '') == layer.id()
+                                   and source.get('source_fid') is not None
+                                   and int(source['source_fid']) == feature.id())]
+            targets = CopyPointTargetsDialog(
+                layer, target_rows, source, self._resolve_reuse_target_fields(layer),
+                selected_ids=layer.selectedFeatureIds(), parent=self.iface.mainWindow())
+            if targets.exec() != QDialog.DialogCode.Accepted:
+                self.dock.set_status('Copia del punto annullata.')
+                return
+            target_ids = targets.selected_ids()
+            if not target_ids:
+                self._warn('Seleziona almeno una riga di destinazione.')
+                return
+            expected = {row['fid']: row for row in target_rows if row['fid'] in target_ids}
+            if len(expected) != len(target_ids):
+                raise ValueError('Le righe di destinazione non sono più disponibili.')
+            # Coordinates in the attribute table follow the target layer CRS.
+            geometry = QgsGeometry.fromPointXY(point_wgs84)
+            wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
+            if layer.crs().isValid() and layer.crs() != wgs84:
+                geometry.transform(QgsCoordinateTransform(wgs84, layer.crs(), QgsProject.instance()))
+            destination_point = geometry.asPoint()
             vals = {
-                **target_fields,
-                "x": lon,
-                "y": lat,
+                **targets.target_fields,
+                "x": destination_point.x(),
+                "y": destination_point.y(),
                 "dem": source.get("altitude_m"),
                 "uncertainty": source.get("uncert_m"),
                 "model_radius": source.get("model_r_m"),
             }
 
-            target_taxon_field = getattr(self.mapping, "scientific_name", None) if self.mapping else None
-            target_taxon = self._feature_text(target_feature, target_taxon_field)
-            source_taxon = str(source.get("taxon") or "")
-            warning = ""
-            if target_taxon and source_taxon and target_taxon.casefold() != source_taxon.casefold():
-                warning = (
-                    "\n\nAttenzione: il taxon del record sorgente è diverso. "
-                    "Coordinate e incertezze verranno copiate, ma GSS ed ecologia "
-                    "non vengono ricalcolati."
-                )
+            source_taxon = str(source.get('taxon') or '')
+            different_taxa = sum(bool(row['taxon'] and source_taxon and
+                                      row['taxon'].casefold() != source_taxon.casefold())
+                                 for row in expected.values())
+            different_localities = sum(not CopyPointTargetsDialog.same_locality(row, source)
+                                       for row in expected.values())
+            warning = ('\n\nCoordinate e incertezze vengono copiate senza ricalcolare GSS o ecologia.')
+            if different_taxa:
+                warning += f'\nTaxon diverso dal sorgente: {different_taxa} righe.'
+            if different_localities:
+                warning += f'\nLocalità/comune diversi o non disponibili: {different_localities} righe.'
 
             summary = (
-                "Copiare questa georeferenziazione nel record selezionato?\n\n"
+                f"Copiare questa georeferenziazione in {len(target_ids)} righe della tabella {layer.name()}?\n\n"
                 f"Taxon sorgente: {source_taxon or '-'}\n"
                 f"Località: {source.get('locality') or '-'}\n"
                 f"Comune: {source.get('municipality') or '-'}\n"
                 f"Coordinate: {lat:.6f}, {lon:.6f}\n"
                 f"Quota DEM: {source.get('altitude_m') if source.get('altitude_m') is not None else '-'} m\n"
-                f"Incertezza GBIF: {source.get('uncert_m') if source.get('uncert_m') is not None else '-'} m\n"
-                f"R55–S70: {source.get('model_r_m') if source.get('model_r_m') is not None else '-'} m"
+                f"Incertezza località: {source.get('uncert_m') if source.get('uncert_m') is not None else '-'} m\n"
+                f"Incertezza GeoLichen: {source.get('model_r_m') if source.get('model_r_m') is not None else '-'} m"
                 + warning
             )
             reply = QMessageBox.question(
                 self.iface.mainWindow(),
-                "Copia punto già confermato",
+                "Copia su altri record",
                 summary,
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
-            if reply != QMessageBox.Yes:
+            if reply != QMessageBox.StandardButton.Yes:
                 self.dock.set_status("Copia del punto annullata.")
                 return
 
@@ -1769,9 +2075,13 @@ class PluginController:
                     "source_feature_id": source.get("source_fid"),
                     "point_changed_by_gbif": False,
                 }
-                self._write_confirmed_point_to_feature(
-                    layer, target_feature, vals, snapped_point_wgs84=point_wgs84
-                )
+                if QgsProject.instance().mapLayer(layer.id()) is not layer:
+                    raise ValueError('La tabella di destinazione è stata rimossa.')
+                features = [layer.getFeature(fid) for fid in target_ids]
+                if any(not feature.isValid() or self._copy_target_row(feature) != expected[feature.id()]
+                       for feature in features):
+                    raise ValueError('Le righe di destinazione sono cambiate. Ripeti la copia.')
+                self._write_confirmed_points_to_features(layer, features, vals, point_wgs84)
             finally:
                 self.current_selected_candidate = previous_candidate
                 self.current_suitability_result = previous_result
@@ -1780,92 +2090,230 @@ class PluginController:
             self._clear_confirmed_uncertainty_band()
             self._show_confirmed_point_marker(point_wgs84)
             self.dock.set_status(
-                "Punto confermato copiato senza rieseguire l’analisi."
+                f"Punto copiato in {len(target_ids)} righe senza rieseguire l’analisi."
+                + (' Salva le modifiche della tabella per renderle permanenti.' if layer.isEditable() else '')
             )
         except Exception as exc:
             self._warn(f"Copia del punto fallita: {exc}")
 
-    def start_confirm_point_capture(self):
-        """Attiva la selezione con snap a un candidato del ranking.
+    def start_ecological_point_selection(self):
+        """Rank once, then guide the manual pick without repeating analysis."""
+        if (getattr(self, '_automatic_point_running', False)
+                or self._ecological_choice_running or self._candidate_dialog_busy):
+            return
+        self.stop_confirm_point_capture()
+        self._ecological_choice_running = True
+        action_states = []
+        try:
+            for name in ('btnHabitatSuitability', 'btnAutomaticPoint'):
+                button = getattr(self.dock, name, None)
+                if button is not None:
+                    action_states.append((button, button.isEnabled()))
+                    button.setEnabled(False)
+            result = self.find_habitat_suitability_point()
+            if result is None or result is not self.current_suitability_result:
+                return
+            candidates = result.get('display_features') or result.get('features') or []
+            if not candidates:
+                self._warn('La griglia non contiene punti candidati selezionabili.')
+                return
+            dialog = EcologicalPointChoiceDialog(len(candidates), self.iface.mainWindow())
+            self._candidate_dialog = dialog
+            try:
+                accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            finally:
+                self._candidate_dialog = None
+                dialog.deleteLater()
+            if not accepted:
+                self.dock.set_status('Scelta del punto ecologico annullata. La griglia resta disponibile.')
+                return
+            if result is self.current_suitability_result and self._require_current_analysis_record():
+                self.start_confirm_point_capture()
+        except Exception as exc:
+            self.stop_confirm_point_capture()
+            self._warn(f'Scelta del punto ecologico non disponibile: {exc}')
+        finally:
+            self._ecological_choice_running = False
+            for button, enabled in action_states:
+                if not sip.isdeleted(button):
+                    button.setEnabled(enabled)
 
-        Questa funzione è solo UI/scrittura attributi: non modifica buffer,
-        scoring, ITALIC, quota o pipeline ecologica.
-        """
+    def stop_confirm_point_capture(self, restore_previous=True):
+        """Disconnect capture and restore the canvas tool without touching results."""
+        self._clear_candidate_preview_info()
+        tool = self.confirm_point_tool
+        previous = self.confirm_previous_tool
+        self.confirm_point_tool = None
+        self.confirm_previous_tool = None
+        if tool is not None and not sip.isdeleted(tool):
+            for signal, slot in (
+                (tool.canvasClicked, self._on_confirm_point_clicked),
+                (tool.canvasMoved, self._on_confirm_point_moved),
+                (tool.captureCancelled, self._cancel_ecological_point_selection),
+                (tool.deactivated, self._on_candidate_capture_deactivated),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except (TypeError, RuntimeError):
+                    pass
+            canvas = self.iface.mapCanvas()
+            if canvas.mapTool() is tool:
+                canvas.unsetMapTool(tool)
+                if restore_previous and previous is not None and not sip.isdeleted(previous):
+                    canvas.setMapTool(previous)
+            tool.deleteLater()
+        self._clear_confirm_snap_marker()
+
+    def _cancel_ecological_point_selection(self):
+        self.stop_confirm_point_capture()
+        self.dock.set_status('Scelta del punto ecologico terminata. Nessun dato scritto.')
+
+    def _on_candidate_capture_deactivated(self):
+        # Changing to another QGIS map tool ends capture without overriding it.
+        self.stop_confirm_point_capture(restore_previous=False)
+
+    def _ensure_candidate_points_visible(self, candidates):
+        result = self.current_suitability_result
+        layer = result.get('layer')
+        if layer is None or sip.isdeleted(layer) or not layer.isValid():
+            layer = self.habitat_suitability_service._create_points_layer(
+                candidates, layer_name='Punti candidati — scelta ecologica',
+                uncertainty=result.get('uncertainty'))
+            result['layer'] = layer
+        if QgsProject.instance().mapLayer(layer.id()) is None:
+            QgsProject.instance().addMapLayer(layer)
+        node = QgsProject.instance().layerTreeRoot().findLayer(layer.id())
+        if node is not None:
+            node.setItemVisibilityChecked(True)
+        layer.triggerRepaint()
+
+    def start_confirm_point_capture(self):
+        """Pick a ranked candidate; reuse the existing scores and result layer."""
+        if getattr(self, '_automatic_point_running', False) or self._candidate_dialog_busy:
+            return
         layer = self._valid_input_or_active_layer()
         if layer is None or not self._layer_supports_fields(layer):
             self._warn('Nessun layer attivo compatibile.')
             return
-
-        self.active_layer = layer
         feature = self._selected_feature()
         if feature is None:
-            self._warn('Seleziona una riga nella tabella prima di confermare il punto.')
+            self._warn_record_selection()
             return
-
-        # Il cerchio di incertezza appartiene esclusivamente alla selezione
-        # della tabella. Durante la conferma viene nascosto e non deve essere
-        # ricreato automaticamente al termine della scrittura.
+        if not self._require_current_analysis_record():
+            return
+        result = self.current_suitability_result or {}
+        candidates = result.get('display_features') or result.get('features') or []
+        if not candidates:
+            self._warn('Esegui prima Analisi ecologica step by step.')
+            return
+        self.stop_confirm_point_capture()
+        self.active_layer = layer
+        self._ensure_candidate_points_visible(candidates)
+        if self.search_extent is not None and not self.search_extent.isEmpty():
+            self._zoom_to_geometry(self.search_extent)
         self._clear_confirmed_visuals()
-
+        self._prepare_candidate_snap_index(candidates)
         canvas = self.iface.mapCanvas()
-
-        try:
-            if self.confirm_point_tool is not None:
-                self.confirm_point_tool.canvasClicked.disconnect(self._on_confirm_point_clicked)
-                try:
-                    self.confirm_point_tool.canvasMoved.disconnect(self._on_confirm_point_moved)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
+        self.confirm_previous_tool = canvas.mapTool()
         self.confirm_point_tool = CandidateSnapMapTool(canvas)
         self.confirm_point_tool.canvasClicked.connect(self._on_confirm_point_clicked)
         self.confirm_point_tool.canvasMoved.connect(self._on_confirm_point_moved)
+        self.confirm_point_tool.captureCancelled.connect(self._cancel_ecological_point_selection)
         canvas.setMapTool(self.confirm_point_tool)
-
+        self.confirm_point_tool.deactivated.connect(self._on_candidate_capture_deactivated)
         self.dock.set_status(
-            'Muovi il cursore vicino ai candidati: il quadrato azzurro mostra lo snap. Clicca per confermare.'
-        )
+            'Scegli un punto sulla mappa: il quadrato azzurro indica il candidato agganciato. '
+            'Esc o clic destro per uscire.')
+
+    def _prepare_candidate_snap_index(self, candidates):
+        """Index once in a local metric CRS; pointer movement queries nearby rows."""
+        cache = self._candidate_snap_cache
+        if cache is not None and cache['rows'] is candidates:
+            return cache
+        self._candidate_snap_cache = None
+        try:
+            first = next(row['point'] for row in candidates if row.get('point') is not None)
+            transform = QgsCoordinateTransform(
+                QgsCoordinateReferenceSystem('EPSG:4326'), local_metric_crs(first), QgsProject.instance())
+            indexed_rows = {}
+            index = QgsSpatialIndex()
+            for identifier, row in enumerate(candidates):
+                point = row.get('point')
+                if point is None:
+                    continue
+                projected = transform.transform(QgsPointXY(point))
+                if not all(math.isfinite(value) for value in (projected.x(), projected.y())):
+                    continue
+                feature = QgsFeature()
+                feature.setId(identifier)
+                feature.setGeometry(QgsGeometry.fromPointXY(projected))
+                if index.addFeature(feature):
+                    indexed_rows[identifier] = row
+            self._candidate_snap_cache = {
+                'rows': candidates, 'index': index, 'transform': transform, 'indexed_rows': indexed_rows}
+        except Exception:
+            # Preserve the previous full scan if an index/CRS cannot be built.
+            self._candidate_snap_cache = None
+        return self._candidate_snap_cache
 
     def _nearest_confirm_candidate(self, canvas_point):
-        """Restituisce candidato, distanza metrica e punto click WGS84."""
+        """Return the nearest existing candidate, metric distance and WGS84 click."""
         canvas = self.iface.mapCanvas()
         canvas_crs = canvas.mapSettings().destinationCrs()
-        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
         geom_click = QgsGeometry.fromPointXY(QgsPointXY(canvas_point))
         if canvas_crs.isValid() and canvas_crs != wgs84:
-            geom_click.transform(
-                QgsCoordinateTransform(canvas_crs, wgs84, QgsProject.instance())
-            )
+            geom_click.transform(QgsCoordinateTransform(canvas_crs, wgs84, QgsProject.instance()))
         click_wgs84 = geom_click.asPoint()
-
-        candidates = (self.current_suitability_result or {}).get("display_features") or (self.current_suitability_result or {}).get("features") or []
-        selected = None
-        selected_distance = None
-        for row in candidates:
-            candidate_point = row.get("point")
+        result = self.current_suitability_result or {}
+        candidates = result.get('display_features') or result.get('features') or []
+        nearby = candidates
+        cache = self._prepare_candidate_snap_index(candidates)
+        if cache is not None:
+            try:
+                projected = cache['transform'].transform(QgsPointXY(click_wgs84))
+                identifiers = cache['index'].nearestNeighbor(projected, 8)
+                indexed = cache['indexed_rows']
+                nearby = [indexed[identifier] for identifier in identifiers if identifier in indexed] or candidates
+            except Exception:
+                nearby = candidates
+        selected, selected_distance = None, None
+        for row in nearby:
+            candidate_point = row.get('point')
             if candidate_point is None:
                 continue
             try:
                 distance = self.habitat_suitability_service.uncertainty_service._distance_m(
-                    QgsPointXY(click_wgs84), candidate_point
-                )
+                    QgsPointXY(click_wgs84), candidate_point)
             except Exception:
                 continue
             if distance is not None and (selected_distance is None or distance < selected_distance):
-                selected = row
-                selected_distance = float(distance)
+                selected, selected_distance = row, float(distance)
         return selected, selected_distance, click_wgs84
+
+    def _prompt_candidate_use(self, selected, distance):
+        dialog = CandidateUseDialog(int(selected.get('rank') or 0),
+                                    float(selected.get('score') or 0.0), distance,
+                                    self.iface.mainWindow())
+        self._candidate_dialog = dialog
+        try:
+            return dialog.decision if dialog.exec() == QDialog.DialogCode.Accepted else 'exit'
+        finally:
+            self._candidate_dialog = None
+            dialog.deleteLater()
 
     def _on_confirm_point_moved(self, point):
         """Mostra in tempo reale il candidato verso cui il cursore farà snap."""
+        if getattr(self, '_automatic_point_running', False) or self._candidate_dialog_busy:
+            return
         try:
             selected, distance, _ = self._nearest_confirm_candidate(point)
             if selected is None or selected.get("point") is None:
                 self._clear_confirm_snap_marker()
+                self._clear_candidate_preview_info()
                 return
             self._show_confirm_snap_marker(selected.get("point"))
+            self._queue_candidate_preview(selected)
             rank = int(selected.get("rank") or 0)
             score = float(selected.get("score") or 0.0)
             self.dock.set_status(
@@ -1875,26 +2323,81 @@ class PluginController:
         except Exception:
             pass
 
+    def _clear_candidate_preview_info(self):
+        self._candidate_preview_timer.stop()
+        self._candidate_preview_pending = None
+        self.dock.set_candidate_preview()
+
+    def _queue_candidate_preview(self, selected):
+        result = self.current_suitability_result
+        key_record = self._analysis_record_key
+        source = QgsProject.instance().mapLayer(key_record[0]) if key_record else None
+        if source is None or source.selectedFeatureIds() != [key_record[1]]:
+            self._clear_candidate_preview_info()
+            return
+        point = selected['point']
+        key = (id(result), selected.get('grid_level'), selected.get('rank'), point.x(), point.y(), selected.get('score'))
+        text = (f"Rank {selected.get('rank')} • Lat {point.y():.6f} • Lon {point.x():.6f} (WGS84)\n"
+                'Incertezza GeoLichen (R55–S65): ')
+        self._candidate_preview_pending = (result, selected, key, text)
+        if key in self._candidate_preview_cache:
+            self._candidate_preview_timer.stop()
+            self.dock.set_candidate_preview(text + self._candidate_preview_cache[key])
+        else:
+            self.dock.set_candidate_preview(text + 'calcolo…')
+            self._candidate_preview_timer.start()
+
+    def _finish_candidate_preview(self):
+        pending = self._candidate_preview_pending
+        if not pending or pending[0] is not self.current_suitability_result or self.confirm_point_tool is None:
+            return
+        key_record = self._analysis_record_key
+        source = QgsProject.instance().mapLayer(key_record[0]) if key_record else None
+        if source is None or source.selectedFeatureIds() != [key_record[1]]:
+            self._clear_candidate_preview_info()
+            return
+        result, selected, key, text = pending
+        try:
+            candidates = result.get('display_features') or result.get('features') or []
+            model = self.habitat_suitability_service.uncertainty_service.model_service.estimate(
+                self.current_boundary, candidates, selected['point'], float(selected.get('score') or 0),
+                center_row=selected, grid_step_m=result.get('grid_step_m') or self._get_suitability_grid_step())
+            radius = model.get('model_radius_m')
+            value = f'{float(radius):.1f} m' if radius is not None and math.isfinite(float(radius)) else 'non disponibile'
+        except Exception:
+            value = 'non disponibile'
+        if len(self._candidate_preview_cache) >= 32:
+            self._candidate_preview_cache.pop(next(iter(self._candidate_preview_cache)))
+        self._candidate_preview_cache[key] = value
+        self.dock.set_candidate_preview(text + value)
+
     def _on_confirm_point_clicked(self, point, button=None):
-        """Aggancia il click al candidato più vicino e ricalcola l’incertezza."""
+        """Preview the snapped rank, then open the existing candidate editor."""
+        if getattr(self, '_automatic_point_running', False) or self._candidate_dialog_busy:
+            return
+        if button == Qt.MouseButton.RightButton:
+            self._cancel_ecological_point_selection()
+            return
+        if button not in (None, Qt.MouseButton.LeftButton):
+            return
         layer = self._valid_input_or_active_layer()
         feature = self._selected_feature()
         if layer is None or feature is None:
+            self.stop_confirm_point_capture()
             self._warn('Nessun record selezionato.')
             return
+        if not self._require_current_analysis_record():
+            self.stop_confirm_point_capture()
+            return
 
+        self._candidate_dialog_busy = True
         try:
-            canvas = self.iface.mapCanvas()
-            canvas_crs = canvas.mapSettings().destinationCrs()
-            layer_crs = layer.crs()
-
-            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
             suitability = self.current_suitability_result or {}
             candidates = suitability.get("display_features") or suitability.get("features") or []
             if not candidates:
                 self._warn(
                     "Non sono disponibili candidati da agganciare. "
-                    "Esegui prima Trova punto più probabile."
+                    "Esegui prima Analisi ecologica step by step."
                 )
                 return
 
@@ -1907,70 +2410,33 @@ class PluginController:
             snapped_point = selected.get("point")
             selected_score = float(selected.get("score") or 0.0)
             selected_rank = int(selected.get("rank") or 0)
-            self.current_selected_candidate = selected
             self._show_confirm_snap_marker(snapped_point)
+            self._queue_candidate_preview(selected)
             self.dock.set_status(
                 f"Agganciato al candidato rank {selected_rank} "
                 f"(score {selected_score:.2f}, distanza dal click {selected_distance:.1f} m)."
             )
 
-            # Calcola separatamente l'incertezza geografica GBIF point-radius e il
-            # raggio locale pesato R55-S70 del modello rispetto al candidato scelto.
-            uncertainty = self.habitat_suitability_service.uncertainty_service.estimate(
-                self.current_boundary,
-                candidates,
-                gbif_extent_geom=self.original_locality_extent,
-                best_point=snapped_point,
-                grid_step_m=suitability.get("grid_step_m") or self._get_suitability_grid_step(),
-                selected_score=selected_score,
-                selected_rank=selected_rank,
-                center_source="user_selected_candidate",
-                locality_context=self.current_locality_context,
-                resolved_locality=self.current_resolved_locality,
-            )
-            uncertainty_m = float(uncertainty.get("coordinate_uncertainty_m") or uncertainty.get("uncertainty_m") or 0.0)
+            decision = self._prompt_candidate_use(selected, selected_distance)
+            if decision == 'retry':
+                self._clear_confirm_snap_marker()
+                self._clear_candidate_preview_info()
+                self.dock.set_status('Riprova: scegli un altro punto sulla stessa griglia. Esc per uscire.')
+                return
+            if decision != 'use':
+                self._cancel_ecological_point_selection()
+                return
+            if suitability is not self.current_suitability_result or not self._require_current_analysis_record():
+                self.stop_confirm_point_capture()
+                return
+            self.stop_confirm_point_capture()
+            self._show_confirm_snap_marker(snapped_point)
 
-            # Coordinate da scrivere nel CRS del layer del cartellino.
-            geom_snapped_wgs84 = QgsGeometry.fromPointXY(snapped_point)
-            geom_layer = QgsGeometry(geom_snapped_wgs84)
-            if layer_crs.isValid() and layer_crs != wgs84:
-                geom_layer.transform(
-                    QgsCoordinateTransform(wgs84, layer_crs, QgsProject.instance())
-                )
-            pt_layer = geom_layer.asPoint()
-
-            # Campiona il DEM sul candidato agganciato.
-            geom_snapped_canvas = QgsGeometry(geom_snapped_wgs84)
-            if canvas_crs.isValid() and canvas_crs != wgs84:
-                geom_snapped_canvas.transform(
-                    QgsCoordinateTransform(wgs84, canvas_crs, QgsProject.instance())
-                )
-            snapped_canvas_point = geom_snapped_canvas.asPoint()
-
-            # La quota già calcolata durante il ranking è la fonte primaria:
-            # è stata ottenuta con la stessa logica multi-DEM usata per quota,
-            # pendenza ed esposizione del candidato. Se non è disponibile,
-            # si esegue un nuovo campionamento sui DEM selezionati.
-            selected_env = selected.get("env") or {}
-            dem_value = selected_env.get("altitude")
-            try:
-                dem_value = float(dem_value)
-                if not math.isfinite(dem_value):
-                    dem_value = None
-            except Exception:
-                dem_value = None
-
-            if dem_value is None:
-                # Campionamento diretto sul punto candidato in WGS84. Evita
-                # passaggi intermedi nel CRS del canvas e sceglie il tassello
-                # DEM che contiene realmente il punto.
-                dem_value = self._sample_dem_at_confirm_point(
-                    snapped_point, wgs84
-                )
-            else:
-                self.current_confirm_dem_source = (
-                    selected_env.get("dem_source") or None
-                )
+            candidate_values, uncertainty = self._candidate_confirmation_data(
+                layer, selected, candidates, 'user_selected_candidate')
+            uncertainty_m = candidate_values['uncertainty'] or 0.0
+            pt_layer = QgsPointXY(candidate_values['x'], candidate_values['y'])
+            dem_value = candidate_values['dem']
 
             defaults = self._load_confirm_point_defaults()
             defaults["uncertainty"] = uncertainty_m
@@ -1994,23 +2460,28 @@ class PluginController:
                 ),
                 iface=self.iface,
                 candidate_dem_value=dem_value,
+                target_layer=layer,
             )
 
             # Il dialogo di conferma viene mostrato senza modalità applicativa.
-            # Un QDialog.exec_() renderebbe modale l'intera applicazione e
+            # Un QDialog.exec() renderebbe modale l'intera applicazione e
             # impedirebbe a un QgsMapTool aperto dalla validazione di ricevere
             # i click sul canvas. Il QEventLoop locale mantiene invece il
             # flusso sincrono del controller senza bloccare la mappa.
             confirm_loop = QEventLoop()
             dlg.finished.connect(confirm_loop.quit)
-            dlg.setWindowModality(Qt.NonModal)
+            dlg.setWindowModality(Qt.WindowModality.NonModal)
             dlg.setModal(False)
-            dlg.show()
-            dlg.raise_()
-            dlg.activateWindow()
-            confirm_loop.exec_()
+            self._candidate_dialog = dlg
+            try:
+                dlg.show()
+                dlg.raise_()
+                dlg.activateWindow()
+                confirm_loop.exec()
+            finally:
+                self._candidate_dialog = None
 
-            if dlg.result() != QDialog.Accepted:
+            if dlg.result() != QDialog.DialogCode.Accepted:
                 self._clear_confirm_snap_marker()
                 self.dock.set_status('Conferma candidato annullata.')
                 return
@@ -2018,90 +2489,11 @@ class PluginController:
             vals = dlg.values()
             self._save_confirm_point_defaults(vals)
 
-            corrected_lon = uncertainty.get("corrected_center_lon")
-            corrected_lat = uncertainty.get("corrected_center_lat")
-            corrected_text = "non calcolabile"
-            if corrected_lon is not None and corrected_lat is not None:
-                corrected_text = f"{float(corrected_lat):.6f}, {float(corrected_lon):.6f}"
-            locality_type = getattr(self.current_locality_context, "locality_type", "unknown") or "unknown"
-            geometry_type = getattr(self.current_locality_context, "geometry_type", "unknown") or "unknown"
-
-            msg = (
-                f"Usare il candidato rank {selected_rank} come posizione finale?\n\n"
-                "RISULTATO ECOLOGICO\n"
-                f"GSS candidato: {round(selected_score, 2)}\n"
-                f"Distanza click-candidato: {round(selected_distance, 1)} m\n"
-                f"{vals['x_field']}: {vals['x']}\n"
-                f"{vals['y_field']}: {vals['y']}\n"
-            )
-            if vals.get("dem_field"):
-                msg += f"{vals['dem_field']}: {vals['dem']}\n"
-            model_confidence = uncertainty.get('model_confidence') or uncertainty.get('confidence') or '-'
-            locality_label = ConfirmPointDialog._locality_type_label(locality_type)
-            geometry_label = ConfirmPointDialog._geometry_type_label(geometry_type)
-            center_method_label = ConfirmPointDialog._center_method_label(
-                uncertainty.get('corrected_center_method')
-            )
-            confidence_label = ConfirmPointDialog._model_confidence_label(model_confidence)
-            confidence_index = uncertainty.get('model_confidence_index')
-            if confidence_index is None:
-                confidence_index = uncertainty.get('model_confidence_score')
-            try:
-                confidence_text = f"{float(confidence_index):.0f}% ({confidence_label})"
-            except Exception:
-                confidence_text = confidence_label
-            center_distance_text = ConfirmPointDialog._center_distance_text(
-                corrected_lon, corrected_lat, snapped_point
-            )
-
-            msg += f"Raggio del modello R55-S70: {float(uncertainty.get('model_radius_m') or 0):.1f} m\n"
-            msg += f"Affidabilità del modello (MCI): {confidence_text}\n"
-            for reason in (uncertainty.get('model_confidence_reasons') or [])[:3]:
-                msg += f"- {reason}\n"
-            msg += "\n"
-            msg += "GEOREFERENZIAZIONE GBIF\n"
-            msg += f"Tipo di località: {locality_label} ({geometry_label})\n"
-            msg += f"Centro corretto GBIF: {corrected_text}\n"
-            msg += f"Distanza dal punto GeoLichen: {center_distance_text}\n"
-            msg += f"Incertezza geografica GBIF: {vals['uncertainty']} m\n"
-            msg += "L'incertezza è calcolata esclusivamente sulla geometria documentale SLGE.\n"
-            if uncertainty.get("slge_active"):
-                try:
-                    gci_text = f"{float(uncertainty.get('slge_geometry_confidence') or 0) * 100.0:.0f}%"
-                except Exception:
-                    gci_text = "-"
-                msg += f"Sorgente geometria documentale: {uncertainty.get('slge_documented_source') or '-'}\n"
-                msg += f"Metodo geometria documentale: {uncertainty.get('slge_documented_method') or '-'}\n"
-                msg += f"Geometry Confidence Index: {gci_text}\n"
-                if uncertainty.get("slge_requires_review"):
-                    msg += "Verifica manuale geometria: richiesta\n"
-            if uncertainty.get("terrain_reconstruction_available"):
-                terrain_status = "utilizzata" if uncertainty.get("terrain_reconstruction_used") else "fallback semantico"
-                msg += "\nRICOSTRUZIONE MORFOLOGICA\n"
-                msg += f"Esito: {terrain_status}\n"
-                if uncertainty.get("terrain_summit_elevation_m") is not None:
-                    msg += f"Quota cima: {float(uncertainty.get('terrain_summit_elevation_m')):.1f} m\n"
-                if uncertainty.get("terrain_polygon_area_km2") is not None:
-                    msg += f"Area poligono: {float(uncertainty.get('terrain_polygon_area_km2')):.3f} km²\n"
-                if uncertainty.get("terrain_validation_confidence") is not None:
-                    msg += f"Confidenza validazione: {float(uncertainty.get('terrain_validation_confidence')) * 100.0:.0f}%\n"
-                if uncertainty.get("terrain_manual_review_required"):
-                    msg += "Revisione manuale terrain: richiesta\n"
-            msg += f"Metodo di calcolo del centro: {center_method_label}"
-
-
-            reply = QMessageBox.question(
-                self.iface.mainWindow(),
-                'Usa questo candidato',
-                msg,
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                self._clear_confirm_snap_marker()
-                self.dock.set_status('Scrittura annullata.')
+            if suitability is not self.current_suitability_result or not self._require_current_analysis_record():
                 return
-
+            previous_candidate = self.current_selected_candidate
+            previous_metadata = self.current_selection_metadata
+            self.current_selected_candidate = selected
             self.current_selection_metadata = {
                 "selection_method": "manual_candidate_selection",
                 "selected_rank": selected_rank,
@@ -2111,13 +2503,17 @@ class PluginController:
                 "manual_snap_distance_m": selected_distance,
                 "point_changed_by_gbif": False,
             }
-            if self.current_suitability_result is not None:
-                self.current_suitability_result["selection"] = dict(self.current_selection_metadata)
-                self.current_suitability_result["selected_point"] = snapped_point
-                self.current_suitability_result["selected_candidate"] = selected
-                self._update_candidate_selection_layer(selected, self.current_selection_metadata)
-
-            self._write_confirmed_point_to_feature(layer, feature, vals, snapped_point_wgs84=snapped_point)
+            try:
+                self._write_confirmed_point_to_feature(
+                    layer, layer.getFeature(feature.id()), vals, snapped_point_wgs84=snapped_point)
+            except Exception:
+                self.current_selected_candidate = previous_candidate
+                self.current_selection_metadata = previous_metadata
+                raise
+            suitability.update(selection=dict(self.current_selection_metadata),
+                               selected_point=snapped_point, selected_candidate=selected,
+                               uncertainty=uncertainty)
+            self._update_candidate_selection_layer(selected, self.current_selection_metadata)
             # Il punto confermato resta sempre visibile. Il cerchio blu è invece
             # legato alla selezione della riga e ricompare al successivo evento
             # reale di selezione nella tabella attributi.
@@ -2125,19 +2521,14 @@ class PluginController:
             self._show_confirmed_point_marker(snapped_point)
             self._clear_confirm_snap_marker()
 
-            try:
-                if self.confirm_point_tool is not None:
-                    self.confirm_point_tool.canvasClicked.disconnect(self._on_confirm_point_clicked)
-                try:
-                    self.confirm_point_tool.canvasMoved.disconnect(self._on_confirm_point_moved)
-                except Exception:
-                    pass
-                self.confirm_point_tool = None
-            except Exception:
-                pass
+            self.dock.set_status(f'Punto ecologico di rank {selected_rank} confermato e scritto nella tabella {layer.name()}.')
 
         except Exception as exc:
             self._warn(f'Conferma punto fallita: {exc}')
+        finally:
+            self._candidate_dialog_busy = False
+            if self.confirm_point_tool is None:
+                self._clear_confirm_snap_marker()
 
     def _sample_dem_at_confirm_point(self, canvas_point, canvas_crs):
         sample = self._sample_first_valid_dem(canvas_point, canvas_crs)
@@ -2181,24 +2572,24 @@ class PluginController:
 
         provider = layer.dataProvider()
         provider.addAttributes([
-            QgsField('source_lyr', QVariant.String, len=120),
-            QgsField('source_fid', QVariant.LongLong),
-            QgsField('record_id', QVariant.String, len=120),
-            QgsField('taxon', QVariant.String, len=255),
-            QgsField('locality', QVariant.String, len=255),
-            QgsField('municipality', QVariant.String, len=160),
-            QgsField('rank', QVariant.Int),
-            QgsField('gss', QVariant.Double),
-            QgsField('raw_score', QVariant.Double),
-            QgsField('confidence', QVariant.Double),
-            QgsField('uncert_m', QVariant.Double),
-            QgsField('model_r_m', QVariant.Double),
-            QgsField('altitude_m', QVariant.Double),
-            QgsField('substrate', QVariant.String, len=80),
-            QgsField('pipeline', QVariant.String, len=80),
-            QgsField('longitude', QVariant.Double),
-            QgsField('latitude', QVariant.Double),
-            QgsField('confirmed', QVariant.String, len=32),
+            QgsField('source_lyr', FieldType.String, len=120),
+            QgsField('source_fid', FieldType.LongLong),
+            QgsField('record_id', FieldType.String, len=120),
+            QgsField('taxon', FieldType.String, len=255),
+            QgsField('locality', FieldType.String, len=255),
+            QgsField('municipality', FieldType.String, len=160),
+            QgsField('rank', FieldType.Int),
+            QgsField('gss', FieldType.Double),
+            QgsField('raw_score', FieldType.Double),
+            QgsField('confidence', FieldType.Double),
+            QgsField('uncert_m', FieldType.Double),
+            QgsField('model_r_m', FieldType.Double),
+            QgsField('altitude_m', FieldType.Double),
+            QgsField('substrate', FieldType.String, len=80),
+            QgsField('pipeline', FieldType.String, len=80),
+            QgsField('longitude', FieldType.Double),
+            QgsField('latitude', FieldType.Double),
+            QgsField('confirmed', FieldType.String, len=32),
         ])
         layer.updateFields()
         layer.setCustomProperty('geolichen/confirmed_results', True)
@@ -2230,7 +2621,7 @@ class PluginController:
             return ''
         try:
             value = feature[field_name]
-            return '' if value is None else str(value)
+            return '' if value is None or value == NULL else str(value)
         except Exception:
             return ''
 
@@ -2326,62 +2717,71 @@ class PluginController:
             pass
 
     def _write_confirmed_point_to_feature(self, layer, feature, vals, snapped_point_wgs84=None):
-        """Scrive valori e, se possibile, sposta la geometria sul candidato agganciato."""
-        if layer is None or feature is None:
-            raise ValueError('Layer o feature non disponibile')
+        self._write_confirmed_points_to_features(layer, [feature], vals, snapped_point_wgs84)
 
-        field_map = {
-            vals.get("x_field"): vals.get("x"),
-            vals.get("y_field"): vals.get("y"),
-            vals.get("uncertainty_field"): vals.get("uncertainty"),
-            vals.get("model_radius_field"): vals.get("model_radius"),
-        }
-        if vals.get("dem_field"):
-            field_map[vals.get("dem_field")] = vals.get("dem")
-
-        field_map = {k: v for k, v in field_map.items() if k}
-
-        if not field_map:
-            raise ValueError('Nessun campo selezionato per la scrittura')
-
-        started_editing = False
-        if not layer.isEditable():
-            started_editing = layer.startEditing()
-
-
-        # Per un layer vettoriale puntuale, lo snap non aggiorna soltanto X/Y:
-        # sposta anche la geometria effettiva della feature sul candidato.
-        if snapped_point_wgs84 is not None:
-            try:
-                if QgsWkbTypes.geometryType(layer.wkbType()) == QgsWkbTypes.PointGeometry:
-                    geom = QgsGeometry.fromPointXY(QgsPointXY(snapped_point_wgs84))
-                    wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-                    if layer.crs().isValid() and layer.crs() != wgs84:
-                        geom.transform(
-                            QgsCoordinateTransform(wgs84, layer.crs(), QgsProject.instance())
-                        )
-                    layer.changeGeometry(feature.id(), geom)
-            except Exception as exc:
-                raise ValueError(f'Impossibile applicare lo snap alla geometria: {exc}')
-
-        for field_name, value in field_map.items():
-            idx = layer.fields().indexOf(field_name)
-            if idx < 0:
-                raise ValueError(f'Campo non trovato: {field_name}')
-            layer.changeAttributeValue(feature.id(), idx, value)
-
-        if started_editing:
-            ok = layer.commitChanges()
-            if not ok:
-                raise ValueError('Commit modifiche fallito: ' + '; '.join(layer.commitErrors()))
-
-        if snapped_point_wgs84 is not None:
-            self._append_confirmed_result(layer, feature, vals, snapped_point_wgs84)
-
+    def _write_confirmed_points_to_features(self, layer, features, vals, point_wgs84=None):
+        """Write the source rows as one undoable edit, then mirror confirmed points."""
+        if layer is None or not features or any(feature is None or not feature.isValid() for feature in features):
+            raise ValueError('Layer o righe non disponibili.')
+        entries = [(vals.get(key), vals.get(value)) for key, value in (
+            ('x_field', 'x'), ('y_field', 'y'), ('dem_field', 'dem'),
+            ('uncertainty_field', 'uncertainty'), ('model_radius_field', 'model_radius'))
+                   if vals.get(key)]
+        if not entries:
+            raise ValueError('Nessun campo selezionato per la scrittura.')
+        if len({name for name, _ in entries}) != len(entries):
+            raise ValueError('Ogni valore deve essere scritto in una colonna diversa.')
+        changes = {}
+        for name, value in entries:
+            index = layer.fields().indexOf(name)
+            if index < 0:
+                raise ValueError(f'Campo non trovato: {name}')
+            if value is None or value == NULL:
+                value = None
+            else:
+                try:
+                    value = float(value)
+                    if not math.isfinite(value):
+                        raise ValueError()
+                except (TypeError, ValueError):
+                    raise ValueError(f'Valore numerico non valido per {name}.')
+            changes[index] = value
+        geometry = None
+        if point_wgs84 is not None and QgsWkbTypes.geometryType(layer.wkbType()) == GeometryType.Point:
+            geometry = QgsGeometry.fromPointXY(QgsPointXY(point_wgs84))
+            wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
+            if layer.crs().isValid() and layer.crs() != wgs84:
+                geometry.transform(QgsCoordinateTransform(wgs84, layer.crs(), QgsProject.instance()))
+        started = not layer.isEditable()
+        if started and not layer.startEditing():
+            raise ValueError('La tabella non è modificabile. Esportala in GeoPackage e usa la copia modificabile.')
+        layer.beginEditCommand('GeoLichen: conferma punti')
+        try:
+            for feature in features:
+                if geometry is not None and not layer.changeGeometry(feature.id(), QgsGeometry(geometry)):
+                    raise ValueError(f'Impossibile aggiornare la geometria della riga {feature.id()}.')
+                for index, value in changes.items():
+                    if not layer.changeAttributeValue(feature.id(), index, value):
+                        raise ValueError(f'Impossibile aggiornare la riga {feature.id()}.')
+            layer.endEditCommand()
+            if started and not layer.commitChanges():
+                raise ValueError('Salvataggio fallito: ' + '; '.join(layer.commitErrors()))
+        except Exception:
+            if started:
+                layer.rollBack()
+            else:
+                layer.destroyEditCommand()
+            raise
+        if point_wgs84 is not None:
+            for feature in features:
+                try:
+                    self._append_confirmed_result(layer, feature, vals, point_wgs84)
+                except Exception as exc:
+                    raise ValueError(f'Tabella aggiornata; creazione del punto confermato fallita: {exc}')
         layer.triggerRepaint()
-        self.dock.set_status('Candidato confermato e aggiunto al layer GeoLichen – Punti confermati.')
-
-
+        self.dock.set_status('Punto confermato e aggiunto al layer GeoLichen – Punti confermati.'
+                             + (' Salva le modifiche della tabella per renderle permanenti.'
+                                if layer.isEditable() else ''))
 
     def _estimate_current_boundary_radius_m(self):
         """Stima il raggio del boundary corrente. Fallback: Buffer manuale."""
@@ -2407,8 +2807,7 @@ class PluginController:
 
         Il buffer precedente resta valido finché il nuovo non viene confermato.
         """
-        if self.mapping is None:
-            self._warn('Configura prima i campi input.')
+        if not self._ensure_input_mapping():
             return
 
         layer = self._valid_input_or_active_layer()
@@ -2419,7 +2818,7 @@ class PluginController:
         self.active_layer = layer
         feature = self._selected_feature()
         if feature is None:
-            self._warn('Seleziona una riga nella tabella prima di ridefinire il buffer.')
+            self._warn_record_selection()
             return
 
         if self.search_geometry_mode != "manual" or self.manual_search_extent is None or self.manual_search_extent.isEmpty():
@@ -2428,7 +2827,7 @@ class PluginController:
 
         current_radius = float(self.manual_search_radius_m or self._estimate_current_boundary_radius_m())
         dlg = RedefineBufferDialog(current_radius_m=current_radius, parent=self.iface.mainWindow())
-        if not dlg.exec_():
+        if not dlg.exec():
             self.dock.set_status('Ridefinizione buffer annullata.')
             return
 
@@ -2491,10 +2890,10 @@ class PluginController:
                     'Dopo la conferma GeoLichen riapplicherà la stessa pipeline ecologica '
                     'usata dal punto manuale: litologia solo se pertinente, suolo, foreste, quota e diagnostica.'
                 ),
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
-            if reply != QMessageBox.Yes:
+            if reply != QMessageBox.StandardButton.Yes:
                 self.dock.set_status('Ridefinizione buffer annullata. Il buffer precedente è rimasto invariato.')
                 return
 
@@ -2565,8 +2964,7 @@ class PluginController:
 
     def start_manual_point_capture(self):
         """Attiva un vero click su mappa e crea il boundary senza richiederne uno preesistente."""
-        if self.mapping is None:
-            self._warn('Configura prima i campi input.')
+        if not self._ensure_input_mapping():
             return
 
         layer = self._valid_input_or_active_layer()
@@ -2577,7 +2975,7 @@ class PluginController:
         self.active_layer = layer
         feature = self._selected_feature()
         if feature is None:
-            self._warn('Seleziona una riga nella tabella prima di usare il punto manuale.')
+            self._warn_record_selection()
             return
 
         radius = self._manual_buffer_radius()
@@ -2672,8 +3070,7 @@ class PluginController:
 
         Click sinistro = aggiunge un vertice; click destro = termina la linea e avvia l'analisi.
         """
-        if self.mapping is None:
-            self._warn('Configura prima i campi input.')
+        if not self._ensure_input_mapping():
             return
         layer = self._valid_input_or_active_layer()
         if layer is None or not self._layer_supports_fields(layer):
@@ -2682,7 +3079,7 @@ class PluginController:
         self.active_layer = layer
         feature = self._selected_feature()
         if feature is None:
-            self._warn('Seleziona una riga nella tabella prima di usare la linea manuale.')
+            self._warn_record_selection()
             return
         offset_m = self._manual_line_offset()
         if not math.isfinite(offset_m) or offset_m <= 0:
@@ -2704,8 +3101,8 @@ class PluginController:
         self.manual_line_previous_tool = canvas.mapTool()
         self.manual_line_tool = QgsMapToolEmitPoint(canvas)
         self.manual_line_tool.canvasClicked.connect(self._on_manual_line_clicked)
-        self.manual_line_band = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
-        self.manual_line_vertex_band = QgsRubberBand(canvas, QgsWkbTypes.PointGeometry)
+        self.manual_line_band = QgsRubberBand(canvas, GeometryType.Line)
+        self.manual_line_vertex_band = QgsRubberBand(canvas, GeometryType.Point)
         try:
             self.manual_line_vertex_band.setWidth(5)
             self.manual_line_band.setWidth(3)
@@ -2730,7 +3127,7 @@ class PluginController:
         )
 
     def _on_manual_line_clicked(self, point, button=None):
-        if button == Qt.RightButton:
+        if button == Qt.MouseButton.RightButton:
             if len(self.manual_line_vertices) < 2:
                 self._cancel_active_manual_capture(restore_previous=True)
                 self.dock.set_status('Linea manuale annullata: servono almeno due vertici.')
@@ -2741,7 +3138,7 @@ class PluginController:
                 self._cleanup_manual_line_capture()
                 self._warn(f'Impossibile creare il corridoio manuale. Dettaglio tecnico: {exc}')
             return
-        if button not in (None, Qt.LeftButton) or point is None:
+        if button not in (None, Qt.MouseButton.LeftButton) or point is None:
             return
         pt = QgsPointXY(point)
         self.manual_line_vertices.append(pt)
@@ -2974,11 +3371,11 @@ class PluginController:
 
     def _on_manual_map_point_clicked(self, point, button=None):
         """Crea un buffer valido dal click, indipendentemente dal boundary automatico."""
-        if button == Qt.RightButton:
+        if button == Qt.MouseButton.RightButton:
             self._cancel_active_manual_capture(restore_previous=True)
             self.dock.set_status('Creazione del buffer manuale annullata.')
             return
-        if button not in (None, Qt.LeftButton):
+        if button not in (None, Qt.MouseButton.LeftButton):
             return
 
         feature = self.manual_point_feature or self._selected_feature()
@@ -3070,7 +3467,14 @@ class PluginController:
 
     def _analyze_manual_boundary(self, feature, boundary, radius_m):
         """Analisi completa usando un buffer manuale al posto del geocoding."""
+        layer = self._valid_input_or_active_layer()
+        record_key = (layer.id(), feature.id()) if layer is not None else None
+        if record_key != self._analysis_record_key:
+            self.original_locality_extent = None
+            self.current_resolved_locality = None
+        self._analysis_record_key = record_key
         self.current_feature = feature
+        self._invalidate_candidate_results()
         self.current_environment_result = None
 
         # Il buffer manuale È la geometria iniziale dell'analisi: non deve
@@ -3584,14 +3988,129 @@ class PluginController:
         return "; ".join(parts) if parts else "-"
 
     def _get_suitability_grid_step(self):
+        """Choose the base grid from the current search geometry, never a UI value."""
+        radius = None
+        projected = None
+        if str(self.search_geometry_mode).startswith('manual'):
+            radius = self.manual_search_radius_m
+        geometry = self.search_extent
+        if geometry is not None and not geometry.isEmpty():
+            wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
+            metric = local_metric_crs(geometry.centroid().asPoint())
+            projected = QgsGeometry(geometry)
+            projected.transform(QgsCoordinateTransform(wgs84, metric, QgsProject.instance()))
+            if radius is None:
+                bounds = projected.boundingBox()
+                radius = round(max(bounds.width(), bounds.height()) / 2.0, 6)
+        step = grid_step_for_radius(radius if radius is not None else 0)
+        self.dock.txtSuitabilityGridStep.setText(f'{step:g}')
+        if projected is None:
+            summary = 'Buffer: nessuna area definita • Passo griglia: —'
+        else:
+            area = projected.area()
+            area_text = f'{area / 1_000_000:.2f} km²' if area >= 1_000_000 else f'{area / 10_000:.2f} ha'
+            if self.search_geometry_mode == 'manual_line':
+                extent_text = f'Offset linea: ±{radius:g} m'
+            elif str(self.search_geometry_mode).startswith('manual'):
+                extent_text = f'Raggio buffer: {radius:g} m'
+            else:
+                extent_text = f'Raggio di riferimento: {radius:g} m'
+            summary = f'Area buffer: {area_text} • {extent_text}\nPasso griglia: {step:g} m (base)'
+        self.dock.lblBufferGridInfo.setText(summary)
+        return step
+
+    def _invalidate_candidate_results(self, clear_osm=True):
+        """Discard outputs tied to a previous search area while preserving saved points."""
+        self.stop_confirm_point_capture()
+        if clear_osm:
+            self._clear_osm_trails()
+        self._candidate_preview_cache.clear()
+        self._candidate_snap_cache = None
+        previous = self.current_suitability_result or {}
+        layer_ids = set()
+        for key in ('layer', 'heatmap_layer', 'suitability_surface_layer'):
+            layer = previous.get(key)
+            if layer is not None and not sip.isdeleted(layer):
+                layer_ids.add(layer.id())
+        self.current_suitability_result = None
+        self.current_selected_candidate = None
+        self.current_selection_metadata = None
+        self.current_centroid_result = None
+        for layer_id in layer_ids:
+            if QgsProject.instance().mapLayer(layer_id) is not None:
+                QgsProject.instance().removeMapLayer(layer_id)
+        self._clear_confirm_snap_marker()
+        self.dock.set_habitat_suitability('')
+        self.dock.set_habitat_top10('')
+
+    def _clear_osm_trails(self):
+        """Discard only the managed temporary OSM layer, preserving user layers."""
+        if hasattr(self.dock, 'set_osm_trails_info'):
+            self.dock.set_osm_trails_info('')
+        layer = getattr(self, 'current_osm_trail_layer', None)
+        self.current_osm_trail_layer = None
+        if layer is not None and not sip.isdeleted(layer):
+            if QgsProject.instance().mapLayer(layer.id()) is not None:
+                QgsProject.instance().removeMapLayer(layer.id())
+
+    def finish_with_locality_centroid(self):
+        """Save the full search-area centroid and sample DEMs without ecological ranking."""
+        from ..gui.centroid_result_dialog import CentroidResultDialog
+
+        layer = self._valid_input_or_active_layer()
+        feature = self._selected_feature()
+        if layer is None or feature is None:
+            self._warn('Seleziona il record da georeferenziare.')
+            return
+        if (layer.id(), feature.id()) != self._analysis_record_key:
+            self._warn('Analizza la località o crea un buffer per il record selezionato.')
+            return
+        if self.active_manual_capture_mode is not None:
+            self._warn('Termina o annulla il disegno manuale prima di concludere.')
+            return
+        boundary = self.search_extent
+        if boundary is None or boundary.isEmpty():
+            self._warn('Crea prima l’area di ricerca della località.')
+            return
         try:
-            if hasattr(self.dock, 'txtSuitabilityGridStep'):
-                value = float(self.dock.txtSuitabilityGridStep.text().replace(',', '.'))
-                if value > 0:
-                    return value
-        except Exception:
-            pass
-        return 50
+            wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
+            metric = local_metric_crs(boundary.centroid().asPoint())
+            projected = QgsGeometry(boundary)
+            projected.transform(QgsCoordinateTransform(wgs84, metric, QgsProject.instance()))
+            centroid = projected.centroid()
+            centroid.transform(QgsCoordinateTransform(metric, wgs84, QgsProject.instance()))
+            point = QgsPointXY(centroid.asPoint())
+            elevation = self._sample_dem_at_confirm_point(point, wgs84)
+            dialog = CentroidResultDialog(
+                layer.fields().names(), point.x(), point.y(), elevation,
+                parent=self.iface.mainWindow(),
+            )
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self.dock.set_status('Salvataggio del centroide annullato.')
+                return
+            values = dialog.values()
+            self._invalidate_candidate_results()
+            self.current_selected_candidate = {
+                'point': point, 'altitude': elevation, 'pipeline': 'locality_centroid',
+            }
+            self.current_selection_metadata = {'selection_method': 'locality_centroid'}
+            if any(values.get(k) for k in ('x_field', 'y_field', 'dem_field')):
+                self._write_confirmed_point_to_feature(layer, feature, values, point)
+            else:
+                self._append_confirmed_result(layer, feature, values, point)
+            self.current_centroid_result = {
+                'longitude': point.x(), 'latitude': point.y(),
+                'altitude_m': elevation, 'method': 'locality_centroid',
+                'ecology_used': False,
+            }
+            self._show_confirmed_point_marker(point)
+            altitude = 'non disponibile' if elevation is None else f'{elevation:.1f} m'
+            self.dock.set_status(
+                f'Analisi conclusa al centroide: latitudine {point.y():.6f}, '
+                f'longitudine {point.x():.6f}, quota DEM {altitude}. Ecologia non utilizzata.'
+            )
+        except Exception as exc:
+            self._warn(f'Impossibile salvare il centroide: {exc}')
 
     def _get_suitability_visualization_mode(self):
         """Legge la modalità di visualizzazione richiesta dal dock.
@@ -3638,16 +4157,14 @@ class PluginController:
     def _selected_accessibility_layers(self):
         """Ritorna layer accessibilità selezionati.
 
-        Include:
-        - QgsVectorLayer classici;
-        - QgsVectorTileLayer come oggetti opzionali sperimentali.
+        The selector contains vector line layers usable by the distance engine.
         """
         layers = []
         try:
             if hasattr(self.dock, "lstAccessibilityLayers"):
                 for i in range(self.dock.lstAccessibilityLayers.count()):
                     item = self.dock.lstAccessibilityLayers.item(i)
-                    if item and item.checkState() == 2:
+                    if item and item.checkState() == Qt.CheckState.Checked:
                         label = item.text()
                         clean = label.replace(" [VectorTile]", "")
                         lyr = self._layer_by_name(clean)
@@ -3721,6 +4238,143 @@ class PluginController:
             except Exception:
                 pass
 
+    def _candidate_confirmation_data(self, layer, selected, candidates, center_source):
+        """Use the same uncertainty, CRS and DEM rules for both confirmation paths."""
+        point = selected['point']
+        if not all(math.isfinite(float(value)) for value in (point.x(), point.y())):
+            raise ValueError('Coordinate del candidato non valide.')
+        suitability = self.current_suitability_result or {}
+        uncertainty = self.habitat_suitability_service.uncertainty_service.estimate(
+            self.current_boundary, candidates,
+            gbif_extent_geom=self.original_locality_extent,
+            best_point=point,
+            grid_step_m=suitability.get('grid_step_m') or self._get_suitability_grid_step(),
+            selected_score=float(selected.get('score') or 0.0),
+            selected_rank=int(selected.get('rank') or 0),
+            center_source=center_source,
+            locality_context=self.current_locality_context,
+            resolved_locality=self.current_resolved_locality,
+        )
+        uncertainty_m = float(uncertainty.get('coordinate_uncertainty_m') or
+                              uncertainty.get('uncertainty_m') or 0.0)
+        wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
+        geometry = QgsGeometry.fromPointXY(QgsPointXY(point))
+        if layer.crs().isValid() and layer.crs() != wgs84:
+            geometry.transform(QgsCoordinateTransform(wgs84, layer.crs(), QgsProject.instance()))
+        destination = geometry.asPoint()
+        env = selected.get('env') or {}
+        try:
+            dem = float(env.get('altitude'))
+            if not math.isfinite(dem):
+                dem = None
+        except (TypeError, ValueError):
+            dem = None
+        if dem is None:
+            dem = self._sample_dem_at_confirm_point(point, wgs84)
+        else:
+            self.current_confirm_dem_source = env.get('dem_source') or None
+        return {
+            'x': destination.x(), 'y': destination.y(), 'dem': dem,
+            'uncertainty': uncertainty_m if uncertainty_m > 0 else None,
+            'model_radius': uncertainty.get('model_radius_m'),
+        }, uncertainty
+
+    def find_and_save_automatic_point(self):
+        """Resolve locality interactively, then rank and save rank 1 without map clicks."""
+        if (getattr(self, '_automatic_point_running', False)
+                or self._ecological_choice_running or self._candidate_dialog_busy):
+            return
+        self.stop_confirm_point_capture()
+        self._automatic_point_running = True
+        action_states = []
+        try:
+            for name in ('btnAutomaticPoint', 'btnAnalyze', 'btnHabitatSuitability',
+                         'btnUseLocalityCentroid', 'btnReuseConfirmedPoint',
+                         'btnManualPoint', 'btnManualLine', 'btnRedefineBuffer'):
+                button = getattr(self.dock, name, None)
+                if button is not None:
+                    action_states.append((button, button.isEnabled()))
+                    button.setEnabled(False)
+            if not self._ensure_input_mapping():
+                return
+            layer = self._valid_input_or_active_layer()
+            feature = self._selected_feature()
+            if layer is None or feature is None:
+                self._warn_record_selection()
+                return
+            source_key = (layer.id(), feature.id())
+
+            def same_source():
+                if not self._require_current_analysis_record():
+                    return False
+                if self._analysis_record_key != source_key:
+                    self._warn('La riga di destinazione è cambiata. Ripeti l’analisi automatica.')
+                    return False
+                return True
+
+            self.dock.set_status('Analisi automatica: ricerca della località…')
+            if not self.analyze_selected_record() or not same_source():
+                return
+            self.dock.set_status('Analisi automatica: calcolo della griglia e del ranking…')
+            result = self.find_habitat_suitability_point()
+            if not result or not same_source():
+                return
+            candidates = result.get('display_features') or result.get('features') or []
+            rank_one = [row for row in candidates if row.get('rank') == 1 and row.get('point') is not None]
+            if len(rank_one) != 1:
+                raise ValueError('Non è disponibile un candidato univoco di rank 1. Nessun dato scritto.')
+            selected = rank_one[0]
+            values, uncertainty = self._candidate_confirmation_data(
+                layer, selected, candidates, 'automatic_rank_1')
+            if not same_source():
+                return
+            fields, _ = ConfirmationFieldsService.ensure_fields(
+                layer, ConfirmationFieldsService.resolve(layer, self._load_confirm_point_defaults()))
+            if not same_source():
+                return
+            values.update(fields)
+            metadata = dict(result.get('selection') or {})
+            metadata.update(
+                selection_method='automatic_rank_1', selected_rank=1,
+                selected_score=selected.get('score'), selected_raw_score=selected.get('raw_score'),
+                selected_reason='highest_geolichen_rank_after_gss_and_tie_breaks',
+                manual_snap_distance_m=None, point_changed_by_gbif=False,
+            )
+            previous_candidate = self.current_selected_candidate
+            previous_metadata = self.current_selection_metadata
+            self.current_selected_candidate = selected
+            self.current_selection_metadata = metadata
+            try:
+                self._write_confirmed_point_to_feature(
+                    layer, layer.getFeature(feature.id()), values, snapped_point_wgs84=selected['point'])
+            except Exception:
+                self.current_selected_candidate = previous_candidate
+                self.current_selection_metadata = previous_metadata
+                raise
+            result.update(selected_candidate=selected, selected_point=selected['point'],
+                          selection=metadata, uncertainty=uncertainty)
+            self._update_candidate_selection_layer(selected, metadata)
+            self._save_confirm_point_defaults(values)
+            confirmed = self._confirmed_results_layer()
+            node = QgsProject.instance().layerTreeRoot().findLayer(confirmed.id())
+            if node is not None:
+                node.setItemVisibilityChecked(True)
+            self._clear_confirmed_uncertainty_band()
+            self._show_confirmed_point_marker(selected['point'])
+            self._zoom_to_geometry(QgsGeometry.fromPointXY(selected['point']))
+            self.dock.set_status(
+                f'Punto automatico rank 1 scritto nella tabella {layer.name()}, riga {feature.id()}, '
+                f'GSS {float(selected.get("score") or 0):.2f}. '
+                + ('Salva le modifiche della tabella per renderle permanenti.' if layer.isEditable()
+                   else 'Coordinate, quota e incertezze salvate.'))
+        except Exception as exc:
+            self._warn(f'Punto automatico non completato: {exc}')
+        finally:
+            self._automatic_point_running = False
+            for button, enabled in action_states:
+                if not sip.isdeleted(button):
+                    button.setEnabled(enabled)
+
     def find_habitat_suitability_point(self):
         """Trova il punto ecologicamente più probabile dentro il boundary/buffer corrente.
 
@@ -3756,64 +4410,63 @@ class PluginController:
                 self.search_extent = QgsGeometry(manual_extent)
                 self.current_boundary = QgsGeometry(manual_extent)
 
-        trail_layers = self._selected_accessibility_layers()
+        if not self._require_current_analysis_record():
+            return
+        previous_osm_layer = self.current_osm_trail_layer
+        trail_layers = [layer for layer in self._selected_accessibility_layers()
+                        if layer is not previous_osm_layer
+                        and not layer.customProperty('geolichen/temporary_osm_trails', False)]
         self._ensure_aux_services()
 
         if self.current_boundary is None or self.current_boundary.isEmpty():
             self._warn('Nessun buffer/boundary disponibile. Prima analizza un record, crea un buffer manuale oppure termina la linea manuale.')
             return
 
+        self._clear_osm_trails()
+
         # OSM/Overpass: scarica una sola volta per elaborazione i sentieri
         # presenti nella SearchGeometry e li aggiunge ai layer di accessibilità.
+        osm_notice = ''
         try:
             use_osm = True
             if hasattr(self.dock, "chkUseOsmTrails"):
                 use_osm = bool(self.dock.chkUseOsmTrails.isChecked())
             if use_osm and self.search_extent is not None and not self.search_extent.isEmpty():
                 self.dock.set_status("Download sentieri OpenStreetMap…")
+                self.dock.set_osm_trails_info('OSM: richiesta dei percorsi nel buffer in corso…')
                 # The trail query is independent from the OSM locality query.
                 # Remove only the previous temporary trail layer; never reuse a
                 # locality-geometry response as if it already contained trails.
-                previous_osm_layer = self.current_osm_trail_layer
                 osm_result = self.osm_trail_service.fetch(
                     self.search_extent,
                     QgsCoordinateReferenceSystem("EPSG:4326"),
                 )
                 if osm_result.success and osm_result.layer is not None and osm_result.feature_count > 0:
-                    # Sostituisce l'eventuale layer OSM della precedente elaborazione,
-                    # evitando duplicati e garantendo che il nuovo layer sia quello
-                    # realmente usato dal motore di accessibilità.
-                    if previous_osm_layer is not None and previous_osm_layer.id() != osm_result.layer.id():
-                        try:
-                            if QgsProject.instance().mapLayer(previous_osm_layer.id()) is not None:
-                                QgsProject.instance().removeMapLayer(previous_osm_layer.id())
-                        except Exception:
-                            pass
                     self.current_osm_trail_layer = osm_result.layer
                     trail_layers = [osm_result.layer] + [lyr for lyr in trail_layers if lyr is not osm_result.layer]
                     if hasattr(self.dock, "chkShowOsmTrails") and self.dock.chkShowOsmTrails.isChecked():
                         if QgsProject.instance().mapLayer(osm_result.layer.id()) is None:
                             QgsProject.instance().addMapLayer(osm_result.layer)
                     cache_text = " (cache)" if osm_result.from_cache else ""
+                    summary = self.osm_trail_service.layer_summary(osm_result.layer) + cache_text
+                    if osm_result.warning:
+                        summary += ' ' + str(osm_result.warning)
+                    self.dock.set_osm_trails_info(summary)
                     self.dock.set_status(
                         f"{osm_result.feature_count} geometrie sentieristiche OSM trovate{cache_text}"
                     )
                 else:
-                    if previous_osm_layer is not None:
-                        try:
-                            if QgsProject.instance().mapLayer(previous_osm_layer.id()) is not None:
-                                QgsProject.instance().removeMapLayer(previous_osm_layer.id())
-                        except Exception:
-                            pass
                     self.current_osm_trail_layer = None
-                    if osm_result.error:
-                        self.dock.set_status(
-                            "Dati sentieristici OSM non disponibili: " + str(osm_result.error)
-                        )
+                    osm_notice = ('Dati sentieristici OSM non disponibili: ' + str(osm_result.error)
+                                  if osm_result.error else 'Nessun sentiero OSM trovato nell’area.')
+                    self.dock.set_status(osm_notice)
+                    self.dock.set_osm_trails_info(osm_notice)
         except Exception as exc:
             self.current_osm_trail_layer = None
+            osm_notice = 'Analisi OSM non disponibile: ' + str(exc)
+            self.dock.set_osm_trails_info(osm_notice)
             try:
-                self.dock.set_status("Analisi OSM non disponibile: " + str(exc))
+                self.dock.set_status(osm_notice)
             except Exception:
                 pass
 
@@ -3854,14 +4507,17 @@ class PluginController:
                     record_constraints = self.record_constraints_service.extract_record_constraints(self.current_feature, self.mapping)
                 profile['layer_decision'] = self.ecological_layer_decision_service.decide(profile, record_constraints)
 
+            manual_search = str(self.search_geometry_mode).startswith('manual')
             context = self.context_engine.infer_context(
-                geocoding_result=getattr(self, "current_geocoding_result", None),
+                geocoding_result=None if manual_search else getattr(self, "current_geocoding_result", None),
                 locality_parse_result=getattr(self, "current_locality_parse_result", None),
                 locality_text=getattr(self, "current_locality_text", ""),
             )
             context_point = None
             try:
-                if getattr(self, "current_geocoding_result", None) is not None:
+                if manual_search:
+                    context_point = self.manual_search_center_wgs84 or self.search_extent.centroid().asPoint()
+                elif getattr(self, "current_geocoding_result", None) is not None:
                     c = self.current_geocoding_result.center
                     if c and len(c) == 2:
                         context_point = QgsPointXY(float(c[0]), float(c[1]))
@@ -3899,6 +4555,11 @@ class PluginController:
                 locality_context=self.current_locality_context,
             )
 
+            result['osm_trails_notice'] = osm_notice
+            candidates = result.get('display_features') or result.get('features') or []
+            if not candidates or result.get('best_point') is None:
+                raise ValueError('Nessun punto candidato compatibile dopo i pre-filtri.')
+            self._candidate_preview_cache.clear()
             self.current_suitability_result = result
             self.current_selected_candidate = None
             self.current_selection_metadata = dict(result.get("selection") or {})
@@ -3956,10 +4617,21 @@ class PluginController:
             if hasattr(self.dock, 'set_habitat_top10'):
                 self.dock.set_habitat_top10('\n'.join(top_lines) if top_lines else '-')
 
-            self.dock.set_status(msg + ((' | ' + '; '.join(details[:2])) if details else ''))
+            self.dock.set_status(msg + ((' | ' + '; '.join(details[:2])) if details else '')
+                                 + ((' | ' + osm_notice) if osm_notice else ''))
+            return result
 
         except Exception as exc:
-            self._warn(f'Calcolo punto ecologico fallito: {exc}')
+            self._invalidate_candidate_results(clear_osm=False)
+            if 'Nessun punto candidato compatibile' in str(exc):
+                self._warn(
+                    'Attenzione: nessun punto compatibile nell’area di ricerca.\n\n'
+                    'I dati o i vincoli possono non coincidere con la zona scelta. '
+                    'Controlla località e buffer, quota del record (in metri), DEM e sua copertura, '
+                    'campi e layer ambientali. Un risultato vuoto non dimostra che la specie sia assente.\n\n'
+                    f'Dettaglio: {exc}\n\nNessun punto è stato confermato o scritto.')
+            else:
+                self._warn(f'Calcolo punto ecologico fallito: {exc}')
 
     def _merge_environment_results(self, first, second, italic_profile):
         first = first or {}
@@ -4002,17 +4674,30 @@ class PluginController:
         se l'utente preme Cancel, l'analisi si interrompe e NON viene
         costruito nessun buffer con candidati di fallback.
         """
-        if result is None or not getattr(result, "ok", False):
+        if result is None:
             return result
 
-        candidates = getattr(result, "candidates", None) or []
-        if len(candidates) <= 1:
-            return result
-
+        candidates = getattr(result, "candidates", None) or self._geocoding_candidates(result)
+        dlg = None
         try:
-            dlg = CandidateSelectorDialog(candidates, self.iface.mainWindow())
-            accepted = dlg.exec_()
-            if not accepted:
+            try:
+                initial_map_bbox = self._geocoding_map_bbox()
+            except Exception:
+                initial_map_bbox = None
+            dlg = CandidateSelectorDialog(
+                candidates, self.iface.mainWindow(),
+                preview_callback=self._preview_geocoding_candidate,
+                query=getattr(self, 'current_locality_text', '') or result.query or '',
+                area_search_callback=(lambda query, previous: self.geocoding_service.search_in_area(
+                    query, getattr(self.current_locality_context, 'municipality', ''), initial_map_bbox))
+                    if initial_map_bbox else None,
+                search_callback=lambda query, previous: self.geocoding_service.search_more(
+                    query, getattr(self.current_locality_context, 'municipality', ''), previous))
+            messages = [value for value in (result.error, getattr(result, 'warning', None)) if value]
+            if messages:
+                dlg.search_status.setText(' '.join(messages))
+            accepted = dlg.exec()
+            if accepted != QDialog.DialogCode.Accepted:
                 return None
 
             # GeoLichen 15.3.4a: recupera realmente la riga scelta dall'utente.
@@ -4037,17 +4722,40 @@ class PluginController:
                 if selected:
                     break
 
-            if selected:
-                result.feature = selected
+            if not selected or selected not in dlg.candidates:
+                return None
+            result.feature = selected
+            result.ok = True
+            result.candidates = dlg.candidates
+            result.raw = {'features': dlg.candidates}
+            try:
+                result.matched_source = selected.get("_geolichen_ref_type") or result.matched_source
+            except Exception:
+                pass
+            if self.geocoding_service.use_archive:
                 try:
-                    result.matched_source = selected.get("_geolichen_ref_type") or result.matched_source
-                except Exception:
-                    pass
+                    self.geocoding_service.archive.remember(
+                        getattr(self, 'current_locality_text', '') or result.query,
+                        getattr(self.current_locality_context, 'municipality', ''), selected,
+                        aliases=[selected.get('_geolichen_original_query', '')])
+                except (OSError, ValueError) as exc:
+                    self.dock.set_status(f'Località scelta; archivio non aggiornato: {exc}')
             return result
         except Exception:
             # Se il dialog fallisce è più sicuro fermarsi che creare un buffer ambiguo.
             return None
+        finally:
+            self._clear_candidate_preview()
+            if dlg is not None and not sip.isdeleted(dlg):
+                dlg.deleteLater()
 
+
+    def _geocoding_map_bbox(self):
+        canvas = self.iface.mapCanvas()
+        transform = QgsCoordinateTransform(canvas.mapSettings().destinationCrs(),
+                                            QgsCoordinateReferenceSystem('EPSG:4326'), QgsProject.instance())
+        extent = transform.transformBoundingBox(canvas.extent())
+        return (extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum())
 
     def _preview_geocoding_candidate(self, feature):
         """Mostra temporaneamente bbox/centro del candidato geocoder sulla mappa."""
@@ -4073,7 +4781,7 @@ class PluginController:
             canvas_geom = self._geometry_to_canvas_crs(geom)
 
             geom_type = QgsWkbTypes.geometryType(canvas_geom.wkbType())
-            rb_type = QgsWkbTypes.PointGeometry if geom_type == QgsWkbTypes.PointGeometry else QgsWkbTypes.PolygonGeometry
+            rb_type = GeometryType.Point if geom_type == GeometryType.Point else GeometryType.Polygon
 
             self.candidate_preview_band = QgsRubberBand(canvas, rb_type)
             self.candidate_preview_band.setColor(QColor(255, 190, 0, 220))
@@ -4085,7 +4793,7 @@ class PluginController:
             if center and len(center) == 2:
                 center_geom = QgsGeometry.fromPointXY(QgsPointXY(float(center[0]), float(center[1])))
                 center_canvas_geom = self._geometry_to_canvas_crs(center_geom)
-                self.candidate_preview_center_band = QgsRubberBand(canvas, QgsWkbTypes.PointGeometry)
+                self.candidate_preview_center_band = QgsRubberBand(canvas, GeometryType.Point)
                 self.candidate_preview_center_band.setColor(QColor(255, 80, 0, 240))
                 self.candidate_preview_center_band.setWidth(8)
                 self.candidate_preview_center_band.setToGeometry(center_canvas_geom, None)
@@ -4220,8 +4928,7 @@ class PluginController:
         return None
 
     def run_italic_lookup(self):
-        if self.mapping is None:
-            self._warn('Configura prima i campi input.')
+        if not self._ensure_input_mapping():
             return
         layer = self._valid_input_or_active_layer()
         if layer is None or not self._layer_supports_fields(layer):
@@ -4230,7 +4937,7 @@ class PluginController:
         self.active_layer = layer
         feature = self._selected_feature()
         if feature is None:
-            self._warn('Seleziona una riga nella tabella.')
+            self._warn_record_selection()
             return
         scientific_name = self._get_taxon_value(feature)
         if not scientific_name:
@@ -4285,12 +4992,12 @@ class PluginController:
                 pass
             self.rubber_band = None
         geom_type = QgsWkbTypes.geometryType(geometry.wkbType())
-        if geom_type == QgsWkbTypes.LineGeometry:
-            rb_type = QgsWkbTypes.LineGeometry
-        elif geom_type == QgsWkbTypes.PointGeometry:
-            rb_type = QgsWkbTypes.PointGeometry
+        if geom_type == GeometryType.Line:
+            rb_type = GeometryType.Line
+        elif geom_type == GeometryType.Point:
+            rb_type = GeometryType.Point
         else:
-            rb_type = QgsWkbTypes.PolygonGeometry
+            rb_type = GeometryType.Polygon
         self.rubber_band = QgsRubberBand(canvas, rb_type)
         self.rubber_band.setColor(QColor(220, 30, 30, 180))
         self.rubber_band.setFillColor(QColor(220, 30, 30, 60))

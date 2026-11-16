@@ -226,7 +226,7 @@ class SoilService:
             return None
         if any(k in txt for k in ["subac", "acid", "acida", "acido", "acidico", "silic", "silice", "torb", "peat"]):
             return "acid"
-        if any(k in txt for k in ["subbas", "basic", "basica", "basico", "alcal", "calc", "calcare", "carbonat", "dolom"]):
+        if any(k in txt for k in ["subbas", "basic", "basica", "basico", "alcal", "alkal", "base-rich", "calc", "calcare", "carbonat", "dolom"]):
             return "basic"
         if any(k in txt for k in ["neutr", "subneutral"]):
             return "neutral"

@@ -2,6 +2,9 @@ import json
 import os
 import math
 
+from .collapsible_section import CollapsibleSection
+from ..services.confirmation_fields_service import ConfirmationFieldsService
+
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
     QComboBox,
@@ -42,10 +45,12 @@ class ConfirmPointDialog(QDialog):
         explainability_report=None,
         iface=None,
         candidate_dem_value=None,
+        target_layer=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Usa questo candidato")
         self.fields = list(fields or [])
+        self.target_layer = target_layer
         self.defaults = defaults or {}
         self.uncertainty_info = uncertainty_info or {}
         self.locality_context = locality_context
@@ -56,7 +61,7 @@ class ConfirmPointDialog(QDialog):
         self.candidate_score = candidate_score
         self.candidate_dem_value = candidate_dem_value if candidate_dem_value is not None else dem_value
 
-        self.resize(820, 760)
+        self.resize(820, 640)
         layout = QVBoxLayout(self)
 
         # Tutto il contenuto principale vive in un'area scorrevole.
@@ -64,8 +69,8 @@ class ConfirmPointDialog(QDialog):
         # quindi senza QScrollArea i campi e i pulsanti finali risultavano coperti.
         self.scrollArea = QScrollArea(self)
         self.scrollArea.setWidgetResizable(True)
-        self.scrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.scrollArea.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scrollArea.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scrollArea.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.scrollContent = QWidget(self.scrollArea)
         contentLayout = QVBoxLayout(self.scrollContent)
         contentLayout.setContentsMargins(6, 6, 6, 6)
@@ -263,7 +268,7 @@ class ConfirmPointDialog(QDialog):
                 + _component_line("Errore del datum", datum_m)
                 + (
                     f"<br>ℹ Risoluzione del candidato: {grid_error_m:.1f} m "
-                    "(passo griglia / √2; NON sommata all’incertezza GBIF)"
+                    "(passo griglia / √2; NON sommata all’incertezza località)"
                     if grid_error_m > 0
                     else "<br>ℹ Risoluzione del candidato: non disponibile"
                 )
@@ -451,7 +456,7 @@ class ConfirmPointDialog(QDialog):
             f"<b>Punto GeoLichen:</b> {eco_text}<br>"
             f"<b>Rank:</b> {rank_text} &nbsp;&nbsp; <b>GSS:</b> {score_text}<br>"
             f"<b>Distanza click–candidato:</b> {snap_text}<br>"
-            f"<b>Raggio del modello R55–S70:</b> {model_radius:.1f} m<br>"
+            f"<b>Incertezza GeoLichen (R55–S65):</b> {model_radius:.1f} m<br>"
             f"<b>Affidabilità del modello (MCI):</b> {model_confidence_text}"
             f"{confidence_reasons_html}<br>"
             f"<b>Stabilità della soluzione (SSI):</b> {ssi_text}"
@@ -461,7 +466,7 @@ class ConfirmPointDialog(QDialog):
             f"<b>Confidenza della classificazione:</b> {float(class_conf) * 100.0:.0f}%<br>"
             f"<b>Centro corretto GBIF:</b> {corrected_text}<br>"
             f"<b>Distanza dal punto GeoLichen:</b> {center_distance_text}<br>"
-            f"<b>Incertezza geografica GBIF:</b> {unc_text}"
+            f"<b>Incertezza località (metodo GBIF):</b> {unc_text}"
             f"{point_floor_html}<br>"
             f"<b>Risoluzione del candidato:</b> "
             f"{self._format_optional_m(self.uncertainty_info.get('candidate_resolution_m'))}<br>"
@@ -474,17 +479,21 @@ class ConfirmPointDialog(QDialog):
         )
         info.setWordWrap(True)
         info.setTextFormat(1)  # Qt.RichText senza import aggiuntivi
-        contentLayout.addWidget(info)
+        self.detailsSection = CollapsibleSection('Dettagli del risultato, GBIF e incertezza')
+        self.detailsSection.content_layout.addWidget(info)
+        contentLayout.addWidget(self.detailsSection)
 
         self.btnExplain = QPushButton("Mostra spiegazione del risultato")
+        self.btnExplain.setToolTip('Mostra come i dati disponibili hanno contribuito al punteggio del candidato.')
         self.btnExplain.setEnabled(bool(self.explainability_report))
         self.btnExplain.clicked.connect(self._show_explainability)
-        contentLayout.addWidget(self.btnExplain)
+        self.detailsSection.content_layout.addWidget(self.btnExplain)
 
         self.btnValidateResult = QPushButton("Valida questo risultato")
+        self.btnValidateResult.setToolTip('Confronta il candidato con una posizione reale nota per misurarne l’errore.')
         self.btnValidateResult.setEnabled(self.iface is not None and self.ecological_point_wgs84 is not None)
         self.btnValidateResult.clicked.connect(self._show_interactive_validation)
-        contentLayout.addWidget(self.btnValidateResult)
+        self.detailsSection.content_layout.addWidget(self.btnValidateResult)
 
         form = QFormLayout()
 
@@ -502,14 +511,16 @@ class ConfirmPointDialog(QDialog):
             cmb.addItem("")
             cmb.addItems(self.fields)
 
-        self._apply_default_or_auto(self.cmbXField, self.defaults.get("x_field"), ["x", "coord_x", "easting", "est", "utm_x"])
-        self._apply_default_or_auto(self.cmbYField, self.defaults.get("y_field"), ["y", "coord_y", "northing", "nord", "utm_y"])
+        self._apply_default_or_auto(self.cmbXField, self.defaults.get("x_field"), ["longitude", "decimallongitude", "coordinata x", "coordinate x", "x", "coord_x", "easting", "est", "utm_x"])
+        self._apply_default_or_auto(self.cmbYField, self.defaults.get("y_field"), ["latitude", "decimallatitude", "coordinata y", "coordinate y", "y", "coord_y", "northing", "nord", "utm_y"])
         self._apply_default_or_auto(self.cmbDemField, self.defaults.get("dem_field"), ["quota", "quota_dem", "dem", "altitudine", "altitude", "z"])
         self._apply_default_or_auto(
             self.cmbUncertaintyField,
             self.defaults.get("uncertainty_field"),
             [
                 "coordinateuncertaintyinmeters",
+                "inc_loc_m",
+                "incertezza località",
                 "incertezza gbif (m)",
                 "incertezza gbif",
                 "gbif_uncertainty",
@@ -520,7 +531,7 @@ class ConfirmPointDialog(QDialog):
         self._apply_default_or_auto(
             self.cmbModelRadiusField,
             self.defaults.get("model_radius_field"),
-            ["r55_s70", "r55", "model_radius_m", "model_radius", "incertezza_modello", "incertezza_r55"],
+            ["inc_geo_m", "incertezza geolichen", "r55_s70", "r55", "model_radius_m", "model_radius", "incertezza_modello", "incertezza_r55"],
         )
 
         self.spinUncertainty = QDoubleSpinBox()
@@ -533,7 +544,9 @@ class ConfirmPointDialog(QDialog):
         except Exception:
             self.spinUncertainty.setValue(0)
 
-        self.txtModelRadius = QLineEdit(self._format_optional_m(model_radius))
+        self.txtModelRadius = QLineEdit(
+            self._format_optional_m(self.uncertainty_info.get("model_radius_m"))
+        )
         self.txtModelRadius.setReadOnly(True)
 
         try:
@@ -559,23 +572,72 @@ class ConfirmPointDialog(QDialog):
         form.addRow("Campo Y", self.cmbYField)
         form.addRow("Quota DEM", self.txtDem)
         form.addRow("Campo quota DEM", self.cmbDemField)
-        form.addRow("Incertezza GBIF", self.spinUncertainty)
-        form.addRow("Campo incertezza GBIF", self.cmbUncertaintyField)
-        form.addRow("Incertezza R55–S70", self.txtModelRadius)
-        form.addRow("Campo incertezza R55–S70", self.cmbModelRadiusField)
-        form.addRow("Differenza R55–S70 − GBIF", self.txtUncertaintyDifference)
-        form.addRow("Risoluzione del candidato", self.txtCandidateResolution)
+        form.addRow("Incertezza località", self.spinUncertainty)
+        form.addRow("Campo incertezza località", self.cmbUncertaintyField)
+        form.addRow("Incertezza GeoLichen", self.txtModelRadius)
+        form.addRow("Campo incertezza GeoLichen", self.cmbModelRadiusField)
+        self.spinUncertainty.setToolTip('Incertezza geografica della località, calcolata con il metodo point-radius GBIF.')
+        self.txtModelRadius.setToolTip('Raggio del modello R55–S65 in metri.')
+        diagnostics = QFormLayout()
+        diagnostics.addRow("Differenza GeoLichen − località", self.txtUncertaintyDifference)
+        diagnostics.addRow("Risoluzione del candidato", self.txtCandidateResolution)
+        self.detailsSection.content_layout.addLayout(diagnostics)
         contentLayout.addLayout(form)
+        self.btnCreateFields = QPushButton('Crea le colonne mancanti')
+        self.btnCreateFields.setToolTip('Crea nella tabella le colonne numeriche mancanti per coordinate, quota e incertezze.')
+        self.btnCreateFields.clicked.connect(self._create_missing_fields)
+        contentLayout.addWidget(self.btnCreateFields)
+        self.lblFieldsStatus = QLabel()
+        self.lblFieldsStatus.setWordWrap(True)
+        contentLayout.addWidget(self.lblFieldsStatus)
+        if target_layer is not None:
+            self.lblFieldsStatus.setText(f'Tabella di destinazione: {target_layer.name()}')
+            resolved = ConfirmationFieldsService.resolve(target_layer, self.defaults)
+            for key, combo in self._field_combos().items():
+                combo.setCurrentText(resolved.get(key, ''))
+        for combo in self._field_combos().values():
+            combo.currentTextChanged.connect(self._update_create_fields_button)
+        self._update_create_fields_button()
         contentLayout.addStretch(1)
 
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        ok_button = self.buttons.button(QDialogButtonBox.Ok)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setToolTip('Salva coordinate, quota e incertezze del candidato nei campi scelti.')
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setToolTip('Annulla questo passaggio senza confermare i dati.')
+        ok_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
         if ok_button is not None:
             ok_button.setText("Usa questo candidato")
         self.buttons.accepted.connect(self._validate_and_accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
+    def _field_combos(self):
+        return dict(zip((row[0] for row in ConfirmationFieldsService.FIELDS),
+                        (self.cmbXField, self.cmbYField, self.cmbDemField,
+                         self.cmbUncertaintyField, self.cmbModelRadiusField)))
+
+    def _update_create_fields_button(self, *_):
+        missing = any(not combo.currentText().strip() for combo in self._field_combos().values())
+        self.btnCreateFields.setVisible(missing)
+        self.btnCreateFields.setEnabled(self.target_layer is not None)
+
+    def _create_missing_fields(self):
+        try:
+            mapping = {key: combo.currentText() for key, combo in self._field_combos().items()}
+            mapping, created = ConfirmationFieldsService.ensure_fields(self.target_layer, mapping)
+            self.fields = self.target_layer.fields().names()
+            for key, combo in self._field_combos().items():
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItem('')
+                combo.addItems(self.fields)
+                combo.setCurrentText(mapping[key])
+                combo.blockSignals(False)
+            self._update_create_fields_button()
+            self.lblFieldsStatus.setText('Colonne create: ' + ', '.join(created) +
+                ('. Salva le modifiche della tabella per renderle permanenti.'
+                 if self.target_layer.isEditable() else '.'))
+        except Exception as exc:
+            QMessageBox.warning(self, 'Creazione colonne', str(exc))
 
     def _show_interactive_validation(self):
         try:
@@ -602,9 +664,9 @@ class ConfirmPointDialog(QDialog):
             # La referenza viene conservata per evitare la distruzione da parte
             # del garbage collector mentre la finestra è aperta.
             dialog = InteractiveValidationDialog(iface=self.iface, context=context, parent=self)
-            dialog.setWindowModality(Qt.NonModal)
+            dialog.setWindowModality(Qt.WindowModality.NonModal)
             dialog.setModal(False)
-            dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
             self._interactive_validation_dialog = dialog
             dialog.destroyed.connect(lambda *_: setattr(self, '_interactive_validation_dialog', None))
             dialog.show()
@@ -629,8 +691,11 @@ class ConfirmPointDialog(QDialog):
         layout.addWidget(browser)
         actions = QHBoxLayout()
         btn_json = QPushButton("Esporta JSON")
+        btn_json.setToolTip('Salva la spiegazione del risultato in un file JSON.')
         btn_html = QPushButton("Esporta HTML")
+        btn_html.setToolTip('Salva la spiegazione del risultato in una pagina HTML.')
         btn_pdf = QPushButton("Esporta PDF")
+        btn_pdf.setToolTip('Salva la spiegazione del risultato in un documento PDF.')
         btn_json.clicked.connect(lambda: self._export_explainability(report, "json"))
         btn_html.clicked.connect(lambda: self._export_explainability(report, "html"))
         btn_pdf.clicked.connect(lambda: self._export_explainability(report, "pdf"))
@@ -639,10 +704,11 @@ class ConfirmPointDialog(QDialog):
         actions.addWidget(btn_pdf)
         actions.addStretch(1)
         layout.addLayout(actions)
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setToolTip('Chiude questa finestra.')
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        dialog.exec_()
+        dialog.exec()
 
 
     def _export_explainability(self, report, export_format):
@@ -671,8 +737,8 @@ class ConfirmPointDialog(QDialog):
                 from qgis.PyQt.QtPrintSupport import QPrinter
                 document = QTextDocument()
                 document.setHtml(self._explainability_html(report))
-                printer = QPrinter(QPrinter.HighResolution)
-                printer.setOutputFormat(QPrinter.PdfFormat)
+                printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+                printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
                 printer.setOutputFileName(path)
                 document.print_(printer)
             QMessageBox.information(self, "Explainable GeoLichen", f"Report esportato in:\n{path}")
@@ -710,8 +776,19 @@ class ConfirmPointDialog(QDialog):
 
         env_rows = report.get("environment_rows") or []
         if env_rows:
+            coverage = report.get("environment_evidence_coverage")
+            quality_coverage = report.get("environment_quality_coverage")
             html.extend([
                 f"<h3>2. Dettaglio ambientale ({esc(report.get('environment_group'))})</h3>",
+            ])
+            if coverage is not None and quality_coverage is not None:
+                html.append(
+                    f"<p>Copertura delle evidenze: <b>{float(coverage):.1f}%</b>; "
+                    f"ponderata per evidenze indirette: <b>{float(quality_coverage):.1f}%</b>. "
+                    "I dati mancanti mantengono un contributo neutro. "
+                    "Questi valori non indicano la probabilità di correttezza del punto.</p>"
+                )
+            html.extend([
                 "<table cellspacing='0' cellpadding='5' border='1' width='100%'>"
                 "<tr><th align='left'>Sottocomponente</th><th>Stato</th><th>Score</th><th>Peso nominale</th><th>Peso effettivo</th><th>Contributo</th><th align='left'>Motivazione</th></tr>",
             ])
@@ -1102,7 +1179,7 @@ class ConfirmPointDialog(QDialog):
                 return
         for f in self.fields:
             lf = str(f).lower()
-            if any(c in lf for c in candidates):
+            if any(c in lf for c in candidates if len(c) >= 4):
                 combo.setCurrentText(f)
                 return
 
@@ -1115,22 +1192,22 @@ class ConfirmPointDialog(QDialog):
         if not uncertainty_field:
             QMessageBox.warning(
                 self,
-                "Campo incertezza GBIF mancante",
-                "Seleziona il campo in cui scrivere l'incertezza GBIF calcolata.",
+                "Campo incertezza località mancante",
+                "Seleziona il campo in cui scrivere l'incertezza località calcolata.",
             )
             return
         if not model_radius_field:
             QMessageBox.warning(
                 self,
-                "Campo R55–S70 mancante",
-                "Seleziona un campo distinto in cui scrivere l'incertezza R55–S70.",
+                "Campo incertezza GeoLichen mancante",
+                "Seleziona un campo distinto in cui scrivere l'incertezza GeoLichen.",
             )
             return
         if uncertainty_field == model_radius_field:
             QMessageBox.warning(
                 self,
                 "Campi coincidenti",
-                "L'incertezza GBIF e l'incertezza R55–S70 devono essere scritte in due colonne diverse.",
+                "L'incertezza località e l'incertezza GeoLichen devono essere scritte in due colonne diverse.",
             )
             return
         self.accept()

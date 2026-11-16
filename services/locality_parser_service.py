@@ -2,6 +2,7 @@ import re
 import unicodedata
 
 from ..models.locality_parse_result_model import LocalityParseResultModel, LocalityReference
+from ..core.locality_names import name_variants
 
 
 class LocalityParserService:
@@ -13,6 +14,8 @@ class LocalityParserService:
         if text is None:
             return ""
         text = str(text).strip()
+        variants = name_variants(text)
+        text = variants[1] if len(variants) > 1 else text
         text = str(text).replace("’", "'").replace("`", "'")
         text = unicodedata.normalize("NFKD", text)
         text = "".join(c for c in text if not unicodedata.combining(c))

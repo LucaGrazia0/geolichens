@@ -196,6 +196,15 @@ class SolutionStabilityService:
     def _dbscan(self, nodes, distance_func, eps_m, min_samples=2):
         """DBSCAN minimale, senza dipendenze esterne, adatto ai candidati QGIS."""
         count = len(nodes)
+        # Exact DBSCAN shortcut: with min_samples=2 (self included), every
+        # point linked to selected node 0 is a core point in the same cluster.
+        # Distances were already measured while selecting equivalent solutions.
+        # Dispersed solutions still use the complete algorithm below.
+        if min_samples == 2 and count > 1 and nodes[0].get("selected") and all(
+            node.get("distance_from_center_m", math.inf) <= eps_m
+            for node in nodes[1:]
+        ):
+            return [0] * count
         unvisited = None
         noise = -1
         labels = [unvisited] * count

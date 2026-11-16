@@ -1,16 +1,16 @@
 [general]
 name=GeoLichen
 description=Ecologically assisted georeferencing of historical lichen records in Italy.
-version=15.5.18
+version=15.6.31
 qgisMinimumVersion=3.22
-qgisMaximumVersion=3.99
+qgisMaximumVersion=4.99
 author=Luca Grazia
 email=lucagrazia15@gmail.com
 about=Ranks candidate locations for historical lichen records using locality descriptions, ITALIC ecological profiles and user-supplied environmental layers. Provides candidate inspection, manual refinement, uncertainty estimates and provenance reports.
-    Requires QGIS 3 with Python, NumPy and GDAL (normally included in QGIS desktop installations). No additional pip packages or QGIS plugins are required.
-    Internet access is required for ITALIC and OpenStreetMap/Overpass queries. Automatic geocoding requires a user-supplied MapTiler API key and is subject to the provider's terms and quotas.
+    Requires QGIS 3.22+ or QGIS 4 with Python, NumPy and GDAL (normally included in QGIS desktop installations). No additional pip packages or QGIS plugins are required.
+    Internet access is required for ITALIC and OpenStreetMap/Overpass queries. Locality search uses a configurable Photon service based on OpenStreetMap, with cached and rate-limited requests; no MapTiler key is required. The public Photon demo is for moderate interactive use, without availability guarantees. Configure your own Photon endpoint for intensive use.
     Intended for Italian locality descriptions and Italian lichens, with a default search area of Lombardy. Interface language: Italian. Datasets, optional local dictionaries, taxon indexes, environmental layers and DEMs are not bundled. Local dictionary enhancements are unavailable unless supplied separately.
-    Results are model estimates requiring expert review. QGIS 4 is not supported by this release. Windows and Linux need release testing.
+    Results are model estimates requiring expert review. QGIS 4/Qt 6 port is experimental and needs full QGIS 4 runtime validation. Windows and Linux need release testing.
 homepage=https://github.com/LucaGrazia0/geolichens#readme
 repository=https://github.com/LucaGrazia0/geolichens
 tracker=https://github.com/LucaGrazia0/geolichens/issues
@@ -20,5 +20,36 @@ tags=lichens,georeferencing,biodiversity,ecology,uncertainty,italy
 experimental=True
 deprecated=False
 hasProcessingProvider=False
-changelog=15.5.18: Prepare public distribution, document requirements, use QGIS networking for ITALIC and MapTiler, and store runtime data in the QGIS profile.
+changelog=15.6.31: Add automated release checks, scoped QGIS diagnostics and current OSM user documentation; preserve scoring and network security.
+    15.6.30: Allow slow Photon replies up to 35 seconds within a shared 80-second search budget; recover valid cached locality variants after a municipality network failure.
+    15.6.29: Add non-modal candidate coordinate/model uncertainty preview, explain empty ecological results and clear stale candidates on analysis failure.
+    15.6.28: Search additional name variants after partial matches, prioritize own-name agreement and source municipality evidence, and add search within the initial map area.
+    15.6.27: Reject municipality-only matches for distinct locality names, warn on partial-name alternatives and prevent silent town fallback.
+    15.6.26: Add bounded deeper locality search, conservative name variants, OSM type evidence, optional municipal boundaries and a persistent archive of confirmed locality anchors.
+    15.6.25: Always search localities with a circular metric buffer on the selected point; separate Overpass trail network waiting from query runtime and diagnose reply timeouts.
+    15.6.24: Distinguish OSM walking paths, tracks and access roads with categorized styles and persistent segment counts; enforce total Overpass deadlines and clearer server errors.
+    15.6.23: Separate geographic and accessibility evidence, correct altitude/flat-aspect/tie handling and soil/host proxies; accelerate exact SSI and DEM sampling; align R55-S65 labels.
+    15.6.22: Always confirm the locality before buffer creation, including a single candidate; restore preview and explicit cancellation.
+    15.6.21: Clip downloaded OSM trails to the exact current buffer, refresh temporary layers on buffer changes and prevent stale accessibility data.
+    15.6.20: Replace MapTiler geocoding with cached, configurable Photon/OSM search; preserve Overpass trail analysis and show only usable line layers for accessibility.
+    15.6.19: Port dialogs, scoped Qt/QGIS enums, field types and enum decoding to Qt 6 while retaining QGIS 3 compatibility.
+    15.6.18: Restore Suitability Surface and explain its heatmap visualization in hover descriptions.
+    15.6.17: Rename the visualization option to Heatmap and preserve the previous session selection.
+    15.6.16: Add concise native hover descriptions to plugin buttons, disclosure headers and dialog actions.
+    15.6.15: Fit layer menus, wrapped forms and diagnostics to the dock width; expose complete selected names in tooltips.
+    15.6.14: Single-line configuration title and side-by-side step-by-step/automatic ecological analysis in one box, with record copying below.
+    15.6.13: Full-width configuration header, a 4:1 locality-search/centroid-icon row, and adjacent retry/use actions opposite exit.
+    15.6.12: Guide manual candidate picking from ecological analysis with use/retry/exit, reuse ranked points and remove the separate confirmation button.
+    15.6.11: Correct missing evidence, use structured ecological comparisons and restrict forest proxies to relevant groups; preserve macro weights.
+    15.6.10: Include automatic point processing and record copying in the ecological analysis box, preserving the inner manual-analysis group.
+    15.6.9: Display locality georeferencing and ecological analysis in separate sibling boxes.
+    15.6.8: Rename locality search and record copying, and group ecological analysis with point confirmation.
+    15.6.7: Add automatic locality analysis, ecological ranking and direct rank-1 point output to the selected record.
+    15.6.6: Rename confirmation uncertainty labels, create missing output columns, and copy a confirmed point to manually selected rows.
+    15.6.5: Adapt heatmap display to map zoom without changing the analysis grid, scores, candidates or uncertainty.
+    15.6.3: Keep the computed R55-S70 uncertainty visible next to its destination field in compact candidate confirmation.
+    15.6.2: Preserve source-table field mapping across reloads, track source selection independently of active result layers, and prevent stale-row reuse.
+    15.6.1: Show live search-area size and base grid spacing; collapse candidate diagnostics while keeping data entry visible.
+    15.6.0: Collapsible layer configuration and ITALIC panels, automatic buffer-based grid spacing, grid-aware clipped suitability surfaces and a non-ecological centroid completion workflow.
+    15.5.18: Prepare public distribution, document requirements, use QGIS networking for ITALIC and MapTiler, and store runtime data in the QGIS profile.
     15.5.17: Simplified controller interface, reuse of confirmed points and manual line corridor.
