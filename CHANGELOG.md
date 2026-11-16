@@ -1,5 +1,12 @@
 # Changelog
 
+## 15.6.32 - First public CI compatibility corrections
+
+- Activate source-only GitHub CI after synchronizing the public repository.
+- Replace integer text format in the candidate dialog with Qt.TextFormat.RichText; Qt 6 rejected the integer and prevented candidate confirmation.
+- Correct the indexed-snap regression: QgsSpatialIndex may return more than eight IDs when neighbors tie. Assert the actual shortlist is measured and still excludes the full grid, preserving production selection behavior.
+- Preserve scoring, uncertainty, request policies and all datasets.
+
 ## 15.6.31 - Verified development and distribution workflow
 
 - Preserve the 15.6.30 baseline in local commit ba40402.

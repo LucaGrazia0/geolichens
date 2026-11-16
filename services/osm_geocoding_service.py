@@ -94,7 +94,7 @@ class PhotonGeocoder:
                 raise TimeoutError('Tempo limite complessivo della ricerca Photon superato (80 s).')
             self.network_requests += 1
             payload = json.loads(fetch_text(url, timeout=remaining, headers={
-                'User-Agent': 'GeoLichen/15.6.31 (+https://github.com/LucaGrazia0/geolichens)',
+                'User-Agent': 'GeoLichen/15.6.32 (+https://github.com/LucaGrazia0/geolichens)',
                 'Accept': 'application/json',
             }))
         data = self.normalize(payload, bbox)

@@ -1,4 +1,4 @@
-# GeoLichen 15.6.31 — sviluppo, verifiche e distribuzione
+# GeoLichen 15.6.32 — sviluppo, verifiche e distribuzione
 
 ## Versione di riferimento
 
@@ -59,9 +59,11 @@ dopo esito positivo di entrambi, ZIP e sorgenti pubblici come artefatti.
 Le immagini ufficiali Linux sono fissate a versione e digest; il report registra
 QGIS, Qt, Python e sistema. Un'immagine Linux non verifica Windows o macOS.
 
-La configurazione è locale finché non viene caricata nel repository pubblico.
-Nessuna esecuzione su GitHub, pubblicazione o caricamento sul catalogo QGIS è
-implicita. Il workflow usa permessi di sola lettura e nessun segreto.
+La configurazione è ora attiva nel repository pubblico: ogni push o pull request
+avvia i controlli. Il workflow usa permessi di sola lettura e nessun segreto;
+non pubblica sul catalogo QGIS. La prima esecuzione ha rilevato il formato Qt 6
+della finestra candidato e un’ipotesi errata del test sui vicini equidistanti,
+corretti nella 15.6.32. Consulta l’esito della revisione corrente su GitHub Actions.
 Per stato reale e prova interattiva vedi [compatibilità](QGIS4_COMPATIBILITY.md).
 Fonti: [immagini ufficiali](https://github.com/qgis/qgis-docker),
 [test dei plugin](https://github.com/qgis/qgis-docker/blob/main/desktop/README.md).
@@ -71,7 +73,7 @@ Fonti: [immagini ufficiali](https://github.com/qgis/qgis-docker),
 Usa il Python di QGIS:
 
 ```sh
-python -B tools/prepare_release.py --source-dir dist/geolichen-15.6.31-public-source
+python -B tools/prepare_release.py --source-dir dist/geolichen-15.6.32-public-source
 ```
 
 La procedura controlla i sorgenti, esegue tutte le suite e poi crea lo ZIP con

@@ -224,12 +224,18 @@ class InterfaceRegression(unittest.TestCase):
         self.assertIsNotNone(cache)
         self.assertTrue(cache['indexed_rows'])
         count = len((self.c.current_suitability_result['display_features']))
+        # QGIS may return more than eight IDs for equidistant neighbors.
+        # Verify that only the actual indexed shortlist is measured.
+        projected = cache['transform'].transform(QgsPointXY(selected['point']))
+        identifiers = cache['index'].nearestNeighbor(projected, 8)
+        shortlist = [cache['indexed_rows'][i] for i in identifiers if i in cache['indexed_rows']]
+        self.assertTrue(shortlist)
         distance = self.c.habitat_suitability_service.uncertainty_service._distance_m
         with patch.object(self.c.habitat_suitability_service.uncertainty_service, '_distance_m', wraps=distance) as measure:
             nearest, meters, _ = self.c._nearest_confirm_candidate(selected['point'])
         self.assertIs(nearest, selected)
         self.assertLess(meters, 0.01)
-        self.assertLessEqual(measure.call_count, 8)
+        self.assertEqual(measure.call_count, len(shortlist))
         self.assertGreater(count, measure.call_count)
         self.assertIs(self.c._candidate_snap_cache, cache)
 

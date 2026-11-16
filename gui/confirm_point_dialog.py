@@ -478,7 +478,7 @@ class ConfirmPointDialog(QDialog):
             "</div>"
         )
         info.setWordWrap(True)
-        info.setTextFormat(1)  # Qt.RichText senza import aggiuntivi
+        info.setTextFormat(Qt.TextFormat.RichText)
         self.detailsSection = CollapsibleSection('Dettagli del risultato, GBIF e incertezza')
         self.detailsSection.content_layout.addWidget(info)
         contentLayout.addWidget(self.detailsSection)

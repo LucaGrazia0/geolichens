@@ -1,6 +1,6 @@
 # GeoLichen - Manuale utente
 
-**Versione del plugin:** 15.6.31  
+**Versione del plugin:** 15.6.32  
 **Edizione del manuale:** 2.0 - 16 novembre 2026  
 **Autore del plugin:** Luca Grazia
 
@@ -47,7 +47,7 @@ L'interfaccia è in italiano. Descrizioni di località, regole e profili sono pe
 ## 2. Installazione e trasferimento su Windows
 ### Installare da ZIP
 
-1. Procurati il pacchetto `geolichen-15.6.31.zip` della distribuzione.
+1. Procurati il pacchetto `geolichen-15.6.32.zip` della distribuzione.
 2. Apri QGIS e scegli **Plugins > Gestisci ed Installa Plugin > Installa da ZIP**. Nelle interfacce inglesi: **Plugins > Manage and Install Plugins > Install from ZIP**.
 3. Seleziona lo ZIP senza decomprimerlo e premi **Installa plugin**.
 4. Verifica che GeoLichen sia abilitato nella scheda dei plugin installati.
@@ -629,7 +629,7 @@ Cache e snapshot ITALIC sono conservati nel profilo QGIS, nella sottocartella Ge
 - [GDAL: opzioni di esportazione CSV](https://gdal.org/en/stable/drivers/vector/csv.html).
 
 
-Questo manuale è stato confrontato con interfaccia, controller e servizi della versione 15.6.31. Per i dettagli implementativi: `services/scoring_model.py`, `services/model_uncertainty_service.py`, `services/model_confidence_service.py`, `services/solution_stability_service.py`, `services/confirmation_fields_service.py` e `controllers/plugin_controller.py`.
+Questo manuale è stato confrontato con interfaccia, controller e servizi della versione 15.6.32. Per i dettagli implementativi: `services/scoring_model.py`, `services/model_uncertainty_service.py`, `services/model_confidence_service.py`, `services/solution_stability_service.py`, `services/confirmation_fields_service.py` e `controllers/plugin_controller.py`.
 
 - [Sorgenti e README GeoLichen](https://github.com/LucaGrazia0/geolichens).
 - [Segnalazione problemi](https://github.com/LucaGrazia0/geolichens/issues): indica versione QGIS, sistema operativo, versione GeoLichen, azione e messaggio di errore; evita di pubblicare chiavi API o dati riservati.

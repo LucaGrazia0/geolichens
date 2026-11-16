@@ -13,7 +13,7 @@ from .network_service import identified_request
 from .diagnostics_service import log
 
 _cooldown_until = {}
-USER_AGENT = b'GeoLichen/15.6.31 (+https://github.com/LucaGrazia0/geolichens)'
+USER_AGENT = b'GeoLichen/15.6.32 (+https://github.com/LucaGrazia0/geolichens)'
 NO_ERROR = QgsBlockingNetworkRequest.ErrorCode.NoError
 
 
