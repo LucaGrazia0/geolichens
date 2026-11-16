@@ -23,6 +23,8 @@ from geolichen.services.performance_service import PerformanceService
 
 class Diagnostics(unittest.TestCase):
     def test_url_secrets_and_taxon_paths_are_not_logged(self):
+        # Synthetic credentials for redaction only; never transmitted.
+        # pragma: allowlist nextline secret
         raw = 'https://user:password@italic.units.it/api/v2/match/PrivateTaxon?key=SECRET token=HIDDEN'
         cleaned = diagnostics.safe_message(raw + ' Authorization: Bearer TOPSECRET')
         for value in ('password@', 'PrivateTaxon', 'SECRET', 'HIDDEN', 'TOPSECRET'):

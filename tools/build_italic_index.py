@@ -20,10 +20,28 @@ BASE_API = "https://italic.units.it/api/v2"
 USER_AGENT = "GeoLichen/ITALIC-api-index-builder"
 
 
+def _validate_api_url(url):
+    """Restrict this optional builder to the official ITALIC HTTPS API."""
+    parts = urllib.parse.urlsplit(url)
+    if (parts.scheme != "https" or parts.hostname != "italic.units.it"
+            or parts.username is not None or parts.password is not None
+            or parts.port not in (None, 443) or not parts.path.startswith("/api/v2/")):
+        raise ValueError("The index builder only accepts the official ITALIC HTTPS API")
+    return url
+
+
+class _ItalicHttpsRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_api_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def fetch_json(url, timeout=30):
+    _validate_api_url(url)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="ignore"))
+    opener = urllib.request.build_opener(_ItalicHttpsRedirects())
+    with opener.open(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="strict"))
 
 
 def normalize_key(name):

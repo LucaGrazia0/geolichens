@@ -15,7 +15,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITES = (
-    'regression_release_tools.py',
+    'regression_release_tools.py', 'regression_security.py',
     'regression_scoring.py', 'regression_analysis.py',
     'regression_osm_geocoding.py', 'regression_locality_search.py',
     'regression_interface.py', 'regression_diagnostics.py', 'smoke_qgis.py',

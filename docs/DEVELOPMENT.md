@@ -1,4 +1,4 @@
-# GeoLichen 15.6.33 — sviluppo, verifiche e distribuzione
+# GeoLichen 15.6.34 — sviluppo, verifiche e distribuzione
 
 ## Versione di riferimento
 
@@ -15,6 +15,8 @@ python -m pip install -r requirements/development.txt
 python -B tools/check_source.py
 ruff check .
 python -B tests/regression_release_tools.py
+python -B tests/regression_security.py
+python -B tools/security_audit.py --report dist/security-audit.json
 ```
 
 `pre-commit install` abilita facoltativamente i due controlli nel checkout di
@@ -22,7 +24,8 @@ sviluppo; non è eseguito automaticamente e non è richiesto agli utenti QGIS.
 Ruff controlla errori di sintassi e nomi non definiti, senza riformattare tutto
 il codice. Il controllo locale dei sorgenti verifica metadati, sintassi,
 versione del manuale, chiavi private e chiamate esplicite di bypass TLS.
-Questi controlli non sostituiscono un audit di sicurezza o la scansione QGIS.
+La scansione offline aggiuntiva con Bandit/detect-secrets è descritta in
+[SECURITY_REVIEW](SECURITY_REVIEW.md); non sostituisce l’approvazione QGIS.
 
 ## Suite completa nel Python di QGIS
 
@@ -54,7 +57,7 @@ su dati reali né la disponibilità dei servizi esterni.
 ## Compatibilità e GitHub Actions
 
 `.github/workflows/checks.yml` prepara verifiche su push, pull request o avvio
-manuale: controlli dei sorgenti, suite nel runtime QGIS 3.40 e QGIS 4.2 e, solo
+manuale: controlli dei sorgenti e scanner offline, suite nel runtime QGIS 3.40 e QGIS 4.2 e, solo
 dopo esito positivo di entrambi, ZIP e sorgenti pubblici come artefatti.
 Le immagini ufficiali Linux sono fissate a versione e digest; il report registra
 QGIS, Qt, Python e sistema. Un'immagine Linux non verifica Windows o macOS.
@@ -73,10 +76,12 @@ Fonti: [immagini ufficiali](https://github.com/qgis/qgis-docker),
 Usa il Python di QGIS:
 
 ```sh
-python -B tools/prepare_release.py --source-dir dist/geolichen-15.6.33-public-source
+python -B tools/prepare_release.py --security-python /percorso/ambiente-sviluppo/bin/python --source-dir dist/geolichen-15.6.34-public-source
 ```
 
-La procedura controlla i sorgenti, esegue tutte le suite e poi crea lo ZIP con
+Usa per `--security-python` un ambiente separato con i requisiti di sviluppo,
+senza installare gli scanner nel QGIS dell’utente. La procedura controlla i
+sorgenti, esegue la scansione offline e tutte le suite, poi crea lo ZIP con
 manifest SHA-256. Usa una cartella di esportazione nuova. Il builder usa una lista
 esplicita e non attraversa dataset o vecchie distribuzioni. La configurazione di
 sviluppo e GitHub entra nei sorgenti pubblici ma non nello ZIP installabile.

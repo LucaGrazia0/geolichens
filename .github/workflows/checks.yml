@@ -21,6 +21,15 @@ jobs:
       - run: python -m pip install -r requirements/development.txt
       - run: python -B tools/check_source.py
       - run: ruff check .
+      - run: python -B tests/regression_security.py
+      - name: Offline source security audit
+        run: python -B tools/security_audit.py --report dist/security-audit.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-security-report
+          path: dist/security-audit.json
+          if-no-files-found: warn
       - run: python -B tests/regression_release_tools.py
   qgis:
     needs: source

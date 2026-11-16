@@ -1,3 +1,6 @@
+> Nota storica: questa pagina descrive le modifiche dell’interfaccia nella serie 15.6.
+> Per servizi, versione e compatibilità attuali usa [il manuale](MANUALE_UTENTE.md).
+
 # GeoLichen 15.6.10 — interfaccia e verifiche
 
 Modifiche aggiornate al 20 ottobre 2026.

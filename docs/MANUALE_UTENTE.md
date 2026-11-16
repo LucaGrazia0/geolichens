@@ -1,7 +1,7 @@
 # GeoLichen - Manuale utente
 
-**Versione del plugin:** 15.6.33  
-**Edizione del manuale:** 2.0 - 16 novembre 2026  
+**Versione del plugin:** 15.6.34  
+**Edizione del manuale:** 2.1 - 16 novembre 2026  
 **Autore del plugin:** Luca Grazia
 
 Guida operativa alla versione attuale: ricerca Photon/OpenStreetMap senza API key,
@@ -36,8 +36,8 @@ Sono disponibili tre percorsi:
 - Connessione Internet per Photon, ITALIC e richieste OpenStreetMap/Overpass; le cache valide possono evitare alcune richieste.
 - Layer ambientali e DEM con copertura adeguata, per le componenti che vuoi valutare.
 
-I metadati consentono QGIS 3.22–3.99 e QGIS 4.x. Questo intervallo non equivale
-alla verifica completa di ogni sistema. Le prove locali della 15.6.32 usano
+I metadati consentono QGIS da 3.40 fino alla serie 4.2. Questo intervallo non equivale
+alla verifica completa di ogni sistema. Le prove locali usano
 QGIS 3.44.9 su macOS. Le suite automatiche su Linux/QGIS 3.40.15 e 4.2.3 sono
 passate su GitHub. Restano da eseguire le prove su Windows e la verifica
 interattiva completa di QGIS 4: consulta [compatibilità e stato](QGIS4_COMPATIBILITY.md).
@@ -47,7 +47,7 @@ L'interfaccia è in italiano. Descrizioni di località, regole e profili sono pe
 ## 2. Installazione e trasferimento su Windows
 ### Installare da ZIP
 
-1. Procurati il pacchetto `geolichen-15.6.33.zip` della distribuzione.
+1. Procurati il pacchetto `geolichen-15.6.34.zip` della distribuzione.
 2. Apri QGIS e scegli **Plugins > Gestisci ed Installa Plugin > Installa da ZIP**. Nelle interfacce inglesi: **Plugins > Manage and Install Plugins > Install from ZIP**.
 3. Seleziona lo ZIP senza decomprimerlo e premi **Installa plugin**.
 4. Verifica che GeoLichen sia abilitato nella scheda dei plugin installati.
@@ -629,7 +629,7 @@ Cache e snapshot ITALIC sono conservati nel profilo QGIS, nella sottocartella Ge
 - [GDAL: opzioni di esportazione CSV](https://gdal.org/en/stable/drivers/vector/csv.html).
 
 
-Questo manuale è stato confrontato con interfaccia, controller e servizi della versione 15.6.33. Per i dettagli implementativi: `services/scoring_model.py`, `services/model_uncertainty_service.py`, `services/model_confidence_service.py`, `services/solution_stability_service.py`, `services/confirmation_fields_service.py` e `controllers/plugin_controller.py`.
+Questo manuale è stato confrontato con interfaccia, controller e servizi della versione 15.6.34. Per i dettagli implementativi: `services/scoring_model.py`, `services/model_uncertainty_service.py`, `services/model_confidence_service.py`, `services/solution_stability_service.py`, `services/confirmation_fields_service.py` e `controllers/plugin_controller.py`.
 
 - [Sorgenti e README GeoLichen](https://github.com/LucaGrazia0/geolichens).
 - [Segnalazione problemi](https://github.com/LucaGrazia0/geolichens/issues): indica versione QGIS, sistema operativo, versione GeoLichen, azione e messaggio di errore; evita di pubblicare chiavi API o dati riservati.
@@ -692,3 +692,23 @@ il problema resta segnalato e non vengono inventati sentieri. Puoi selezionare
 un tuo layer sentieristico in **Accessibilità**; verifica provenienza e copertura.
 Usare dati archiviati può cambiare lo score rispetto all'assenza di accessibilità,
 perché cambia l'evidenza disponibile, non la formula del modello.
+
+
+## 24. Sicurezza e stato della distribuzione — 15.6.34
+
+L'installazione richiede soltanto QGIS e le dipendenze normalmente incluse.
+Bandit, detect-secrets e gli altri strumenti di sviluppo non devono essere
+installati nel Python QGIS dell'utente. Servono a controllare i sorgenti prima
+della creazione dello ZIP; non eseguono una scansione dei tuoi record o delle cache.
+
+I controlli di sicurezza sono locali/offline: nessuna credenziale candidata viene
+inviata ai servizi per verificarla. Restano attivi i controlli HTTPS e le normali
+impostazioni di rete QGIS. Il resoconto descrive anche gli avvisi non bloccanti;
+non certifica il programma né sostituisce la scansione del catalogo QGIS.
+
+Codice e documentazione sono su GitHub; l'invio al catalogo QGIS è ancora da
+eseguire. Per questa release le prove automatiche Linux/QGIS 3.40 e 4.2 e le
+prove locali macOS/QGIS 3.44 sono distinte dalle verifiche ancora necessarie su
+Windows e nell'uso interattivo completo di QGIS 4. Le vecchie note 15.6.x sono
+storiche: per lo stato corrente usa questa guida, il documento di compatibilità
+e il [resoconto di sicurezza](SECURITY_REVIEW.md). Il PDF 15.6.18 non è aggiornato.

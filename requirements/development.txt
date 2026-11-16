@@ -2,3 +2,7 @@
 ruff==0.14.5
 pre-commit==4.3.0
 PyYAML==6.0.3
+
+# Offline source security scans; development only.
+bandit==1.8.6
+detect-secrets==1.5.0

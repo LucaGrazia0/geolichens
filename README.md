@@ -1,5 +1,10 @@
 # GeoLichen
 
+**15.6.34:** scansione offline Bandit/detect-secrets prima della distribuzione,
+controllo degli URL e redirect dello strumento opzionale per l’indice ITALIC,
+e documentazione allineata alle verifiche effettive. Vedi il
+[resoconto di sicurezza](docs/SECURITY_REVIEW.md).
+
 **15.6.33:** in caso di errore Overpass, recupero della risposta completa della
 stessa richiesta dall’archivio locale fino a 30 giorni, con età e avviso visibili.
 La cache ordinaria resta valida 24 ore; le richieste fallite per la stessa area
@@ -46,7 +51,7 @@ using ecological and environmental information, and supports expert review,
 manual refinement, uncertainty estimates and provenance reporting.
 
 Il [manuale utente in italiano](docs/MANUALE_UTENTE.md) descrive installazione,
-configurazione, analisi, interpretazione dei risultati e salvataggio per la 15.6.33.
+configurazione, analisi, interpretazione dei risultati e salvataggio per la 15.6.34.
 Per la nuova ricerca OSM senza API key, leggi anche [migrazione 15.6.20](docs/OSM_MIGRATION_15_6_20.md).
 Per i buffer circolari delle località e l'attesa del download sentieri, vedi
 [aggiornamento 15.6.25](docs/CIRCULAR_BUFFERS_15_6_25.md).
@@ -65,7 +70,7 @@ as published occurrence coordinates.
 
 ## Requirements
 
-- QGIS 3.22–3.99 or QGIS 4.x with its Python environment, NumPy and GDAL/OGR (`osgeo`).
+- QGIS 3.40 through QGIS 4.2 with its Python environment, NumPy and GDAL/OGR (`osgeo`).
   These libraries normally ship with QGIS desktop installers. No additional
   pip packages or other QGIS plugins are required. If an import is missing,
   repair the QGIS installation (on Windows, use the QGIS/OSGeo4W installer).
@@ -79,11 +84,13 @@ as published occurrence coordinates.
   and terrain analyses. These are supplied by the user, with suitable coverage,
   coordinate reference systems and attributes; they are not included.
 
-Version 15.6.19 includes an experimental QGIS 4/Qt 6 port while retaining QGIS 3.
-Full QGIS 4 runtime validation is pending; standalone PyQt6 widget checks do not
-replace it. Windows and Linux still require interactive release testing. See
-[compatibility and test instructions](docs/QGIS4_COMPATIBILITY.md) and
-[publication notes](docs/PUBLISHING.md).
+The release remains experimental. Automated suites passed in real Linux QGIS
+3.40.15 / Qt 5 and QGIS 4.2.3 / Qt 6 runtimes, with local macOS/QGIS 3.44.9
+verification. Windows and complete interactive QGIS 4 acceptance remain pending.
+Metadata is restricted to 3.40–4.2; older and future minor versions are not
+claimed by this release. This does not establish scientific accuracy or public
+service availability. See [compatibility](docs/QGIS4_COMPATIBILITY.md),
+[security review](docs/SECURITY_REVIEW.md) and [publication](docs/PUBLISHING.md).
 
 ## Installation
 

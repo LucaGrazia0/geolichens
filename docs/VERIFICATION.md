@@ -423,3 +423,29 @@ not a reproduction of the user's exact QGIS request, reported as HTTP 502.
 No further live download was attempted to bypass a refusal. The public servers'
 availability is not repaired by the archive fallback. No data/cache file was
 modified by diagnostic inspection; old cached responses retain their age.
+
+
+## 15.6.34 — source security and documentation alignment
+
+16 November 2026. Full local preparation passed on macOS/QGIS 3.44.9:
+248 regression tests across eight regression suites, plus the separate full
+smoke suite (nine suites total). Six security boundary tests cover the optional
+ITALIC builder URL/redirect restrictions, secure report redaction, gate failure
+conditions and isolation of a developer Python from QGIS PYTHONHOME/PYTHONPATH.
+The initial release-preparation attempt exposed inherited QGIS Python paths;
+the corrected launcher removes those only for the separate security interpreter.
+
+Bandit 1.8.6: zero HIGH/MEDIUM, 228 LOW retained (166 B110, 16 B112, 2 B311,
+4 B404, 36 B101, 4 B603), zero scan errors. detect-secrets 1.5.0: zero unresolved
+potential secrets, offline with --no-verify. One synthetic BasicAuth redaction
+fixture is explicitly annotated; no real credential was identified. A medium
+B310 warning in the optional index builder was addressed with HTTPS/host/API-path
+and redirect validation, tested without network access.
+
+Current manual, publication, compatibility and development instructions now
+match Photon/OSM and the passed Linux QGIS 3.40/4.2 workflow evidence. Metadata
+allows 3.40–4.2; Windows and full interactive QGIS 4 acceptance remain pending.
+Past verification notes remain historical, not current compatibility claims.
+No ecological scoring/uncertainty implementation or user dataset/cache changed.
+See SECURITY_REVIEW.md and the generated dist/security-15.6.34.json report for
+scope, findings and limitations. These are not QGIS catalogue approval.

@@ -36,7 +36,9 @@ terms before using or redistributing external data.
 
 `gui/icons/locality_centroid.png` is the image supplied by the project owner for
 the locality-centroid action. The original PNG is embedded unchanged as a UI
-asset. It is not an environmental or specimen dataset.
+asset. It is not an environmental or specimen dataset. The original creator
+and asset license have not been independently documented; the project owner
+must confirm distribution rights before QGIS catalogue submission.
 
 The repository contains plugin source, documentation, the interface image,
 license and developer scripts. Test scripts generate disposable artificial

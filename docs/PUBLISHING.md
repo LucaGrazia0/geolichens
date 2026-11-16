@@ -1,60 +1,74 @@
-# Pubblicazione GeoLichen
+# Pubblicazione GeoLichen — 15.6.34
 
-Il codice è pubblicato su GitHub dal 15 ottobre 2026.
-L’invio al catalogo QGIS non è ancora stato effettuato.
+Il codice pubblico è su [GitHub](https://github.com/LucaGrazia0/geolichens),
+con Issues e controlli automatici attivi. L'invio al catalogo QGIS non è ancora
+stato effettuato. Questa release rimane **sperimentale**.
 
-## Da risolvere prima del rilascio pubblico
+## Stato e verifiche ancora necessarie
 
-1. Il repository pubblico è [LucaGrazia0/geolichens](https://github.com/LucaGrazia0/geolichens),
-   con Issues attive. Sono pubblicati soltanto codice, documentazione, licenza e
-   strumenti di sviluppo, senza dataset né vecchia cronologia locale.
-   Non caricare ZIP, dataset o cache.
-2. `knowledge/`, `data/`, `examples/`, cache e snapshot restano privati e sono
-   esclusi sia dal repository sia dal pacchetto QGIS. Il codice gestisce la
-   mancanza dei dizionari opzionali e dell'indice locale con i fallback esistenti.
-3. Non pubblicare vecchi commit locali contenenti dataset: il primo commit
-   pubblico deve essere creato da un'esportazione pulita, con una nuova cronologia.
-4. I tre link in `metadata.txt` puntano al repository indicato dall'utente.
-   Verificare che README e codice siano presenti nella revisione pubblicata.
-5. Eseguire una prova interattiva su una copia dei propri dati: avvio, lettura
-   ITALIC, geocodifica con chiave personale, selezione candidato, correzione
-   manuale, conferma/salvataggio, riapertura progetto, disattivazione plugin.
-   Ripetere su Windows e Linux. I controlli automatici non dimostrano l'accuratezza
-   scientifica né la compatibilità con tutti i sistemi.
+- Il repository contiene soltanto codice, documentazione, licenza, icona e
+  configurazione di sviluppo. Dataset, cache, snapshot, ZIP e cronologia privata
+  non devono essere caricati nel repository sorgente.
+- Le suite sono passate nei runtime Linux/QGIS 3.40.15 e 4.2.3, con verifica
+  locale macOS/QGIS 3.44.9. La prova Windows e l'uso interattivo completo di
+  QGIS 4 restano distinti e ancora da completare.
+- I metadati consentono QGIS 3.40–4.2. Non dichiarano supporto alle vecchie
+  versioni 3.22 o a versioni future non verificate. L'intervallo non certifica
+  ogni sistema, provider o configurazione compresa tra gli estremi.
+- La ricerca attuale usa Photon/OpenStreetMap senza API key MapTiler;
+  Overpass scarica i percorsi e ITALIC fornisce profili ecologici. Il pacchetto
+  non include questi dataset e non garantisce la disponibilità dei servizi.
+- Per risorse esterne e icona controllare [THIRD_PARTY](../THIRD_PARTY.md).
+  La provenienza/licenza originale dell'immagine fornita dall'autore del
+  progetto deve essere documentata prima dell'invio al catalogo.
+- Il [resoconto di sicurezza](SECURITY_REVIEW.md) descrive strumenti, risultati
+  e limiti; non equivale all'approvazione del catalogo o a validazione scientifica.
 
-## Preparare i sorgenti e lo ZIP
+## Preparare uno ZIP verificato
 
-`python3 tools/build_release.py --preview` produce uno ZIP esplicitamente
-preliminare per le prove locali. `python3 tools/build_release.py` richiede tutti
-i metadati di pubblicazione. Entrambi producono un manifest SHA-256 per verificare
-che ogni file del pacchetto corrisponda ai sorgenti.
-
-Per creare un albero sorgente pulito da caricare su GitHub:
+Nel Python di sviluppo separato installa `requirements/development.txt`.
+Nel Python di QGIS esegui, indicando quel Python per gli scanner:
 
 ```sh
-python3 tools/build_release.py --preview --source-dir dist/public-source/geolichen
+python -B tools/prepare_release.py --security-python /percorso/ambiente-sviluppo/bin/python --source-dir dist/geolichen-15.6.34-public-source
 ```
 
-La directory risultante comprende anche strumenti di sviluppo e test, ma
-esclude tutti i dataset (`knowledge/`, `data/`, `examples/`, JSON e CSV),
-cache, snapshot, file nascosti (eccetto `.gitignore`), bytecode,
-ZIP, binari, manifest generati e vecchie note. Copiare i file sorgente,
-non il contenitore `dist`, nel repository. Prima del rilascio generare di nuovo
-senza `--preview` e confrontare il manifest con la revisione pubblicata.
+Su Windows l'interprete di sviluppo avrà normalmente un percorso come
+`C:\ambiente-sviluppo\Scripts\python.exe`; avvia il comando dalla OSGeo4W Shell
+per il QGIS da verificare. Non installare PyQt6 o gli scanner nel QGIS dell'utente.
 
-## Invio al catalogo QGIS
+La procedura controlla i sorgenti, esegue la scansione offline e le suite,
+quindi genera `dist/geolichen-15.6.34.zip`, manifest SHA-256 e report.
+Qualsiasi errore bloccante impedisce la creazione del nuovo pacchetto.
+Gli avvisi Bandit di livello basso restano nel report e richiedono valutazione.
 
-1. Accedere con il proprio account OSGeo al
-   [catalogo QGIS](https://plugins.qgis.org/plugins/).
-2. Usare [Upload a plugin](https://plugins.qgis.org/plugins/add/) e caricare
-   lo ZIP finale creato dal builder, dopo aver pubblicato la stessa revisione
-   dei sorgenti. Non usare lo ZIP automatico di GitHub: la cartella radice
-   potrebbe avere un nome diverso da `geolichen`.
-3. Controllare le email e la sezione Security della versione caricata;
-   correggere gli eventuali problemi e attendere l'approvazione dei revisori.
-4. Mantenere `experimental=True` fino a quando le prove giustificano un rilascio
-   stabile. Non dichiarare QGIS 4 senza migrazione e prove dedicate.
+Il comando di basso livello `tools/build_release.py` genera uno ZIP senza
+attestare l'esecuzione dei test o degli scanner. `--preview` serve solo a prove
+locali con metadati incompleti: non è un pacchetto da inviare al catalogo.
 
-Le procedure ufficiali sono nelle
-[linee guida](https://plugins.qgis.org/docs/publish) e nella
-[procedura di approvazione](https://plugins.qgis.org/docs/approval).
+L'esportazione pubblica comprende configurazione GitHub/pre-commit, requisiti
+di sviluppo e strumenti; lo ZIP installabile contiene la sola lista ammessa dal
+builder. Dati privati e vecchie distribuzioni non sono attraversati. Usa una
+cartella di esportazione nuova e verifica che codice pubblico e manifest siano
+allineati. Non inviare la cartella `dist` né il sorgente ZIP automatico di GitHub.
+
+## Prova interattiva e invio
+
+Su una copia modificabile dei dati verifica: selezione record, ricerca e scelta
+località, buffer automatico/manuale, lettura ITALIC, percorsi OSM o layer locali,
+candidato guidato/automatico, coordinate/quota/incertezze, copia su altri record,
+salvataggio e riapertura del progetto e disattivazione del plugin.
+
+Accedi con il tuo account OSGeo a [Upload a plugin](https://plugins.qgis.org/plugins/add/)
+e carica lo ZIP finale corrispondente ai sorgenti pubblici. Controlla gli esiti
+nella scheda Security della versione e le eventuali richieste dei revisori.
+Bandit e detect-secrets vengono eseguiti anche sul catalogo con le sue regole:
+una scansione locale favorevole non garantisce l'approvazione.
+
+Mantieni `experimental=True` finché prove d'uso e validazione giustificano una
+release stabile. Il workflow GitHub prepara artefatti dopo controlli riusciti,
+ma non carica automaticamente nulla nel catalogo QGIS.
+
+Fonti: [pubblicazione](https://plugins.qgis.org/docs/publish),
+[scansione](https://plugins.qgis.org/docs/security-scanning),
+[strumenti di sicurezza](https://plugins.qgis.org/docs/security-scanning/tools).

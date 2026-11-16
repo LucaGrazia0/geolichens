@@ -1,5 +1,12 @@
 # Changelog
 
+## 15.6.34 - Offline security checks and current release documentation
+
+- Run Bandit and detect-secrets offline on the allowlisted release/public source; report low findings without suppression and block medium/high findings, unresolved potential secrets or incomplete scans. Add the check to GitHub CI and release preparation using a separate developer Python.
+- Restrict the optional ITALIC index builder to the official HTTPS API, including redirects. Explicitly label the synthetic BasicAuth redaction fixture; no real credential was found.
+- Align compatibility metadata to QGIS 3.40–4.2 and distinguish passed Linux/macOS checks from pending Windows and interactive QGIS 4 acceptance. Update manual, publishing and development instructions; retain historical notes as history.
+- Leave ecological formulas, uncertainty, altitude filters and the normal locality/trail workflow unchanged. No dataset or cache is redistributed.
+
 ## 15.6.33 - Overpass outage recovery and phase timings
 
 - Preserve the 24-hour fresh trail cache. After download failure, recover only an identical-query, complete archive no older than 30 days; label its age and failure, clip it again to the current buffer and preserve its original modification time.

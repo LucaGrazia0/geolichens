@@ -1,16 +1,16 @@
 [general]
 name=GeoLichen
 description=Ecologically assisted georeferencing of historical lichen records in Italy.
-version=15.6.33
-qgisMinimumVersion=3.22
-qgisMaximumVersion=4.99
+version=15.6.34
+qgisMinimumVersion=3.40
+qgisMaximumVersion=4.2
 author=Luca Grazia
 email=lucagrazia15@gmail.com
 about=Ranks candidate locations for historical lichen records using locality descriptions, ITALIC ecological profiles and user-supplied environmental layers. Provides candidate inspection, manual refinement, uncertainty estimates and provenance reports.
-    Requires QGIS 3.22+ or QGIS 4 with Python, NumPy and GDAL (normally included in QGIS desktop installations). No additional pip packages or QGIS plugins are required.
+    Requires QGIS 3.40 through 4.2 with Python, NumPy and GDAL (normally included in QGIS desktop installations). No additional pip packages or QGIS plugins are required.
     Internet access is required for ITALIC and OpenStreetMap/Overpass queries. Locality search uses a configurable Photon service based on OpenStreetMap, with cached and rate-limited requests; no MapTiler key is required. The public Photon demo is for moderate interactive use, without availability guarantees. Configure your own Photon endpoint for intensive use.
     Intended for Italian locality descriptions and Italian lichens, with a default search area of Lombardy. Interface language: Italian. Datasets, optional local dictionaries, taxon indexes, environmental layers and DEMs are not bundled. Local dictionary enhancements are unavailable unless supplied separately.
-    Results are model estimates requiring expert review. QGIS 4/Qt 6 port is experimental and needs full QGIS 4 runtime validation. Windows and Linux need release testing.
+    Results are model estimates requiring expert review. Automated tests passed on Linux/QGIS 3.40.15 and 4.2.3 and macOS/QGIS 3.44.9. Windows and full interactive QGIS 4 acceptance remain pending. No scientific accuracy or external service availability guarantee is implied.
 homepage=https://github.com/LucaGrazia0/geolichens#readme
 repository=https://github.com/LucaGrazia0/geolichens
 tracker=https://github.com/LucaGrazia0/geolichens/issues
@@ -20,7 +20,8 @@ tags=lichens,georeferencing,biodiversity,ecology,uncertainty,italy
 experimental=True
 deprecated=False
 hasProcessingProvider=False
-changelog=15.6.33: Recover complete identical-query OSM archives after download failures, avoid immediate repeated failed requests, and separate trail-download and ecological-calculation timings.
+changelog=15.6.34: Add offline Bandit/detect-secrets checks, restrict the optional ITALIC index builder to the official HTTPS API including redirects, and align current documentation and compatibility metadata.
+    15.6.33: Recover complete identical-query OSM archives after download failures, avoid immediate repeated failed requests, and separate trail-download and ecological-calculation timings.
     15.6.32: Fix Qt 6 candidate dialog text format; make indexed snapping regression accept documented equidistant neighbors. Activate public QGIS CI.
     15.6.31: Add automated release checks, scoped QGIS diagnostics and current OSM user documentation; preserve scoring and network security.
     15.6.30: Allow slow Photon replies up to 35 seconds within a shared 80-second search budget; recover valid cached locality variants after a municipality network failure.
